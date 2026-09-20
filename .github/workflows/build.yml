@@ -7,7 +7,6 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -96,9 +95,3 @@ jobs:
           name: DiskScanner-${{ github.sha }}
           path: ${{ runner.temp }}/DiskScanner.zip
           if-no-files-found: error
-
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ runner.temp }}/DiskScanner.zip

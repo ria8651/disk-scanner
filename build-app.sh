@@ -16,6 +16,18 @@ IDENTITY="${DSCAN_SIGN_IDENTITY:-disk-scanner-dev}"
 APP="build/DiskScanner.app"
 BUNDLE_ID="foundation.msupply.diskscanner"
 
+# Version comes from Cargo.toml so there is exactly one place to change it;
+# the release workflow edits that line and nothing else.
+#
+# CFBundleVersion must increase monotonically for macOS to regard a build as
+# newer, and it is independent of the marketing version -- the commit count
+# gives a number that only ever goes up, without another thing to remember to
+# bump. Neither value affects the designated requirement, so releasing a new
+# version never disturbs an existing Full Disk Access grant.
+VERSION="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version[[:space:]]*=/{gsub(/"/,"");print $3;exit}' Cargo.toml)"
+BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+
+echo "==> building $VERSION (build $BUILD)"
 echo "==> cargo build --release"
 cargo build --release --lib
 
@@ -70,8 +82,8 @@ $ICON_KEYS
        you; a hand-assembled bundle has to say it. -->
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>disk-scanner</string>

@@ -12,6 +12,10 @@ of averaging it away.
 Status: **Engine plus a native macOS front end.** Read-only — nothing is ever
 deleted; the app answers *what would happen if you did*.
 
+![The app showing ~/Downloads: a nested treemap on the left, and an inspector
+reporting 18.13 GiB allocated but 17.99 GiB actually freed, split into what is
+yours, what clones hold, and what a snapshot has pinned.](assets/screenshot.png)
+
 ## The problem, measured
 
 Every claim below was measured on a real 500 GB Apple-silicon Mac running
