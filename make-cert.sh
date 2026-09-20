@@ -109,7 +109,10 @@ Next:
   ./build-app.sh                       build and sign locally
 
 For CI, add two repository secrets (Settings > Secrets and variables > Actions):
-  SIGNING_CERT_P12        base64 -i $P12 | pbcopy    (then paste)
+  SIGNING_CERT_P12        openssl base64 -A -in $P12 | pbcopy   (then paste)
+                          (openssl rather than base64(1): Homebrew's base64
+                          shadows /usr/bin/base64 and rejects -i, and -A
+                          guarantees one unwrapped line)
   SIGNING_CERT_PASSWORD   $P12_PASSWORD
 
 !! BACK UP $P12 SOMEWHERE SAFE (password manager, encrypted backup).

@@ -87,7 +87,7 @@ final class Scan {
             var p = [CChar](repeating: 0, count: 1024)
             var r = [CChar](repeating: 0, count: 256)
             ds_skipped(handle, i, &p, 1024, &r, 256)
-            return (String(cString: p), String(cString: r))
+            return (decodeCString(p), decodeCString(r))
         }
     }
 
@@ -176,7 +176,9 @@ final class Scan {
         if ids.isEmpty {
             return out
         }
-        ids.withUnsafeBufferPointer { ds_reclaim(handle, $0.baseAddress, ids.count, &out) }
+        // Discarding the Bool: it only reports a null handle, which cannot
+        // happen here, and `out` is already zeroed.
+        _ = ids.withUnsafeBufferPointer { ds_reclaim(handle, $0.baseAddress, ids.count, &out) }
         return out
     }
 }
@@ -204,6 +206,10 @@ final class ScanModel {
     var cursor: UInt32 = 0
     /// The block the pointer is over, or the last one clicked.
     var focus: UInt32?
+    /// Pointed at from somewhere else in the UI — an inspector row being
+    /// hovered — so the map can show which block it means. The map's own
+    /// hover stays local to the map, where it repaints nothing else.
+    var highlighted: UInt32?
     /// The selection basket. Reclaim is a property of this set, never a sum.
     var selection: Set<UInt32> = []
     var sort: SortKey = .physical
@@ -330,11 +336,22 @@ final class ScanModel {
 
     // MARK: navigation
 
-    func descend(_ node: UInt32) {
+    /// Navigate into `node`. Returns false when there is nowhere to go —
+    /// a file, or an empty or unreadable folder.
+    @discardableResult
+    func descend(_ node: UInt32) -> Bool {
         guard let s = scan, let r = s.row(node), r.kind == DS_KIND_DIR, r.child_count > 0
-        else { return }
+        else { return false }
         cursor = node
         focus = nil
+        return true
+    }
+
+    /// What a click means, wherever it happens: go there if it is somewhere
+    /// you can go, otherwise show it. Shared by the map and the inspector list
+    /// so a click means the same thing in both.
+    func open(_ node: UInt32) {
+        if !descend(node) { focus = node }
     }
 
     func ascend() {

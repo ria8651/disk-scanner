@@ -99,6 +99,10 @@ private struct SetupScreen<Content: View>: View {
 }
 
 /// Shared by the toolbar and the start panel.
+///
+/// `@MainActor` because `NSOpenPanel` is: without it Swift 6 flags every
+/// property set on the panel as a cross-actor mutation.
+@MainActor
 func chooseFolder() -> String? {
     let panel = NSOpenPanel()
     panel.canChooseDirectories = true

@@ -10,9 +10,18 @@ func cString(_ initial: Int = 1024, _ body: (UnsafeMutablePointer<CChar>, Int) -
     if needed >= initial {
         var big = [CChar](repeating: 0, count: needed + 1)
         _ = big.withUnsafeMutableBufferPointer { body($0.baseAddress!, needed + 1) }
-        return String(cString: big)
+        return decodeCString(big)
     }
-    return String(cString: buf)
+    return decodeCString(buf)
+}
+
+/// Decode a NUL-terminated buffer the C side filled.
+///
+/// Not `String(cString:)`: that is deprecated on arrays precisely because it
+/// has no length bound and will read past the end of one that is somehow not
+/// terminated. Stopping at the NUL ourselves is the same operation, bounded.
+func decodeCString(_ buf: [CChar]) -> String {
+    String(decoding: buf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
 }
 
 /// Byte counts formatted exactly as the Rust side formats them, so the app

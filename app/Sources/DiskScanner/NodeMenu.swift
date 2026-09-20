@@ -20,8 +20,7 @@ extension View {
             }
             if let row, row.kind == DS_KIND_DIR, row.child_count > 0 {
                 Button("Show in Map", systemImage: "square.grid.3x3") {
-                    model.focus = node
-                    model.descend(node)
+                    model.open(node)
                 }
             }
             Divider()

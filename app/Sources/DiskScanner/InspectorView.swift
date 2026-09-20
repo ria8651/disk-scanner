@@ -232,46 +232,68 @@ private struct ContentsSection: View {
 
     var body: some View {
         let rows = scan.children(of: node, sort: model.sort, limit: 60)
-        ForEach(Array(rows.enumerated()), id: \.offset) { _, r in
-            let picked = model.selection.contains(r.node)
-            HStack(spacing: 8) {
-                Button {
-                    // No withAnimation: the footer owns the animation for
-                    // selection changes, so every entry point eases alike.
-                    model.toggle(r.node)
-                } label: {
-                    Image(systemName: picked ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(picked ? Palette.yours : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .help(picked ? "Remove from selection" : "Add to selection")
-
-                Image(systemName: r.kind == DS_KIND_DIR ? "folder" : "doc")
+        // One Form row holding the whole list, laid out here with zero spacing.
+        //
+        // A grouped `Form` on macOS is not a `List`, so `listRowInsets` and
+        // `listRowSeparator` are ignored and the Form's own inter-row spacing
+        // stays outside any hover region a row can define. Owning the stack is
+        // the only way to make adjacent rows actually touch, which is what
+        // stops the highlight flickering off between them.
+        VStack(spacing: 0) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, r in
+                row(r)
+            }
+            if rows.count == 60 {
+                Text("showing the 60 largest")
                     .font(.caption2).foregroundStyle(.tertiary)
-
-                Text(scan.displayName(r.node))
-                    .font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
-
-                Spacer(minLength: 6)
-
-                Text(r.size.physical.formattedBytes)
-                    .font(.system(size: 10, design: .monospaced))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 4)
             }
-            .contentShape(.rect)
-            .onTapGesture {
-                // A single click navigates. `descend` is a no-op for files and
-                // for empty folders, so clicking one of those just inspects it.
-                model.focus = r.node
-                model.descend(r.node)
-            }
-            .nodeMenu(r.node, model: model, scan: scan)
         }
-        if rows.count == 60 {
-            Text("showing the 60 largest")
+    }
+
+    @ViewBuilder
+    private func row(_ r: DsRow) -> some View {
+        let picked = model.selection.contains(r.node)
+        let lit = model.highlighted == r.node
+        HStack(spacing: 8) {
+            Button {
+                // No withAnimation: the footer owns the animation for
+                // selection changes, so every entry point eases alike.
+                model.toggle(r.node)
+            } label: {
+                Image(systemName: picked ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(picked ? Palette.yours : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(picked ? "Remove from selection" : "Add to selection")
+
+            Image(systemName: r.kind == DS_KIND_DIR ? "folder" : "doc")
                 .font(.caption2).foregroundStyle(.tertiary)
+
+            Text(scan.displayName(r.node))
+                .font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
+
+            Spacer(minLength: 6)
+
+            Text(r.size.physical.formattedBytes)
+                .font(.system(size: 10, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
         }
+        // Padding is INSIDE the hover region, and rows are flush, so moving
+        // down the list never crosses a gap that is part of no row.
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.primary.opacity(lit ? 0.09 : 0))
+        )
+        .contentShape(.rect)
+        .onTapGesture { model.open(r.node) }
+        .onHover { model.highlighted = $0 ? r.node : nil }
+        .nodeMenu(r.node, model: model, scan: scan)
     }
 }
 

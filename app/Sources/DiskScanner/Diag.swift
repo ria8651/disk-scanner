@@ -89,11 +89,16 @@ enum Diag {
     static func separators(delay: TimeInterval = 1.5) {
         guard enabled else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            // asyncAfter on the main queue IS the main actor; saying so keeps
+            // the AppKit walk below from being flagged as cross-actor.
+            MainActor.assumeIsolated {
             guard let w = NSApplication.shared.windows.first(where: \.isVisible),
                 let root = w.contentView?.superview
             else { return }
             var out = "[separators]\n"
-            func walk(_ v: NSView, _ depth: Int) {
+            // A nested func is its own isolation scope, so the enclosing
+            // `assumeIsolated` does not cover it.
+            @MainActor func walk(_ v: NSView, _ depth: Int) {
                 let cls = String(describing: type(of: v))
                 let f = v.convert(v.bounds, to: root)
                 let thin = f.height > 0 && f.height <= 2.5 && f.width > 100
@@ -119,6 +124,7 @@ enum Diag {
             }
             walk(root, 0)
             emit(out)
+            }
         }
     }
 

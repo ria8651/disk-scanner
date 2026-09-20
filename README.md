@@ -1,3 +1,5 @@
+<img src="assets/icon-default.png" width="128" align="right" alt="">
+
 # disk-scanner
 
 A macOS disk scanner that tells the truth about APFS.

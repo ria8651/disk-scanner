@@ -1,5 +1,5 @@
+# Rust back end
 /target
-.DS_Store
 
 # Swift front end
 /app/.build/
@@ -10,3 +10,12 @@
 # Signing identity — see make-cert.sh. Never commit these.
 *.p12
 *.pem
+
+# Icon
+**/__pycache__
+assets/preview.png
+assets/icon-dark.png
+assets/icon-tinteddark.png
+assets/variants-matrix.png
+assets/variants/
+assets/logo-scan-512.png

@@ -64,8 +64,16 @@ struct TreemapView: View {
             let t = Date()
             // Paint order is the array order: a container is always drawn
             // before the children that sit on top of it.
+            for r in rects {
+                draw(r, in: ctx)
+            }
+            // Marks go in a SECOND pass for the same reason: a ring drawn with
+            // a container would be painted over by the children inside it, so
+            // focusing a folder would otherwise show nothing at all.
             for (i, r) in rects.enumerated() {
-                draw(r, hovered: i == hoverIndex, in: ctx)
+                let m = marks(for: r, hovered: i == hoverIndex)
+                guard m.any else { continue }
+                outline(blockPath(r).path, m, ctx)
             }
             Diag.slow("canvas draw \(rects.count) rects", t)
         }
@@ -76,8 +84,11 @@ struct TreemapView: View {
             case .ended: hoverIndex = nil
             }
         }
-        .onTapGesture(count: 2) { activate() }
-        .onTapGesture(count: 1) { click() }
+        // ONE tap gesture. Registering `count: 2` as well forces every single
+        // click to wait out the system double-click interval (~0.5s) before it
+        // can commit, because the recogniser has to rule out a second click
+        // first. The count comes from the event instead — see `click`.
+        .onTapGesture { click() }
         .contextMenu {
             // `hovered` is current: the menu opens where the pointer already is.
             if let h = actionable {
@@ -97,17 +108,28 @@ struct TreemapView: View {
     }
 
     private func click() {
-        guard let h = actionable else { return }
-        if NSEvent.modifierFlags.contains(.command) {
+        // Taking the count from the event rather than from a second gesture is
+        // what keeps this instant. It works because the two actions compose: a
+        // double click focuses on the first press then navigates on the
+        // second, and `descend` clears focus anyway, so the intermediate state
+        // is never seen.
+        let event = NSApp.currentEvent
+        let clicks = event?.clickCount ?? 1
+        let command = (event?.modifierFlags ?? NSEvent.modifierFlags).contains(.command)
+
+        guard let h = actionable else {
+            // Clicked a gap, or the aggregate block: fall back to the folder
+            // the map is showing, which is what `focus == nil` means.
+            model.focus = nil
+            return
+        }
+        if command {
             model.toggle(h.node)
+        } else if clicks >= 2 {
+            model.descend(h.node)
         } else {
             model.focus = h.node
         }
-    }
-
-    private func activate() {
-        guard let h = actionable else { return }
-        model.descend(h.node)
     }
 
     /// The deepest rectangle under the cursor. Because layout is pre-order,
@@ -131,10 +153,7 @@ struct TreemapView: View {
             revealInFinder(scan.path(node))
         }
         if let row, row.kind == DS_KIND_DIR, row.child_count > 0 {
-            Button("Show in Map", systemImage: "square.grid.3x3") {
-                model.focus = node
-                model.descend(node)
-            }
+            Button("Show in Map", systemImage: "square.grid.3x3") { model.open(node) }
         }
         Divider()
         Button(
@@ -151,20 +170,35 @@ struct TreemapView: View {
 
     // MARK: drawing
 
-    private func draw(_ r: DsRect, hovered isHover: Bool, in ctx: GraphicsContext) {
-        let rect = CGRect(x: CGFloat(r.x), y: CGFloat(r.y), width: CGFloat(r.w), height: CGFloat(r.h))
-            .insetBy(dx: 0.5, dy: 0.5)
-        guard rect.width > 0.5, rect.height > 0.5 else { return }
+    /// Geometry for one block, shared by the fill pass and the marks pass.
+    private func blockPath(_ r: DsRect) -> (rect: CGRect, radius: CGFloat, path: Path) {
+        let rect = CGRect(
+            x: CGFloat(r.x), y: CGFloat(r.y), width: CGFloat(r.w), height: CGFloat(r.h)
+        ).insetBy(dx: 0.5, dy: 0.5)
         // A rounded corner of radius r needs 2r of BOTH dimensions, so a
         // 3pt-tall sliver can never show more than ~1.5pt of rounding. Half
         // the short side is the geometric ceiling (beyond it the ends turn
         // into a capsule), so take as much of that as looks right.
-        let radius = min(5, min(rect.width, rect.height) / 2.5)
-        let path = Path(roundedRect: rect, cornerRadius: radius, style: .continuous)
-        let isSelected = r.aggregated == 0 && model.selection.contains(r.node)
+        let radius = min(5, max(0, min(rect.width, rect.height)) / 2.5)
+        return (rect, radius, Path(roundedRect: rect, cornerRadius: radius, style: .continuous))
+    }
+
+    private func marks(for r: DsRect, hovered: Bool) -> Marks {
+        let real = r.aggregated == 0
+        return Marks(
+            hover: hovered,
+            selected: real && model.selection.contains(r.node),
+            focused: real && model.focus == r.node,
+            lit: real && model.highlighted == r.node,
+            incomplete: r.incomplete != 0)
+    }
+
+    private func draw(_ r: DsRect, in ctx: GraphicsContext) {
+        let (rect, _, path) = blockPath(r)
+        guard rect.width > 0.5, rect.height > 0.5 else { return }
 
         if r.container != 0 {
-            drawContainer(r, rect, path, isHover: isHover, isSelected: isSelected, in: ctx)
+            drawContainer(r, rect, path, in: ctx)
             return
         }
 
@@ -201,7 +235,6 @@ struct TreemapView: View {
                 with: .color(Palette.yours.jittered(r.node)))
         }
 
-        outline(path, ctx, isHover: isHover, isSelected: isSelected, incomplete: r.incomplete != 0)
         label(
             rect, ctx, title: scan.displayName(r.node),
             subtitle: r.physical.formattedBytes, depth: r.depth)
@@ -211,8 +244,7 @@ struct TreemapView: View {
     /// fill. Filling it would double-count — its children already cover the
     /// same area and carry the colour encoding.
     private func drawContainer(
-        _ r: DsRect, _ rect: CGRect, _ path: Path, isHover: Bool, isSelected: Bool,
-        in ctx: GraphicsContext
+        _ r: DsRect, _ rect: CGRect, _ path: Path, in ctx: GraphicsContext
     ) {
         // Depth shading, so nesting is legible without any extra ink.
         let tint = Double(r.depth) * 0.035
@@ -227,19 +259,42 @@ struct TreemapView: View {
             labelStrip(
                 strip, ctx, title: scan.displayName(r.node), trailing: r.physical.formattedBytes)
         }
-
-        outline(path, ctx, isHover: isHover, isSelected: isSelected, incomplete: r.incomplete != 0)
     }
 
-    private func outline(
-        _ path: Path, _ ctx: GraphicsContext, isHover: Bool, isSelected: Bool, incomplete: Bool
-    ) {
-        if isSelected {
+    /// Everything a block can be at once. They stack rather than compete: a
+    /// block can be focused *and* selected *and* incomplete, and each has to
+    /// stay readable when it is.
+    private struct Marks {
+        let hover: Bool
+        let selected: Bool
+        let focused: Bool
+        let lit: Bool
+        let incomplete: Bool
+
+        var any: Bool { hover || selected || focused || lit || incomplete }
+    }
+
+    private func outline(_ path: Path, _ m: Marks, _ ctx: GraphicsContext) {
+        // Pointed at from the inspector: a wash, so a small block is findable
+        // without hunting for a 2pt outline.
+        if m.lit {
+            ctx.fill(path, with: .color(.white.opacity(0.22)))
+            ctx.stroke(path, with: .color(.white), lineWidth: 2)
+        }
+        if m.selected {
             ctx.stroke(path, with: .color(Palette.yours), lineWidth: 2.5)
-        } else if isHover {
+        } else if m.hover && !m.lit {
             ctx.stroke(path, with: .color(.white.opacity(0.85)), lineWidth: 1.6)
         }
-        if incomplete {
+        if m.focused {
+            // Drawn on the block's own edge, after the selection ring, so a
+            // block that is both simply shows focus. Insetting it to show both
+            // at once looked worse than the collision it avoided. The dark
+            // stroke underneath keeps the white readable on pale blocks.
+            ctx.stroke(path, with: .color(.black.opacity(0.55)), lineWidth: 3.5)
+            ctx.stroke(path, with: .color(.white), lineWidth: 2)
+        }
+        if m.incomplete {
             // A block whose total is a lower bound says so on its face.
             ctx.stroke(
                 path, with: .color(Palette.unknown.opacity(0.8)),

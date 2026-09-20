@@ -129,17 +129,29 @@ private struct SnapshotBanner: View {
     @State private var expanded = false
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+        HStack(alignment: .top, spacing: 10) {
             Image(systemName: "clock.arrow.circlepath")
                 .foregroundStyle(Palette.pinned)
+                .padding(.top, 1)
+
+            // No Spacer here, and the width is claimed explicitly. With a
+            // Spacer the text was squeezed to almost nothing, and
+            // `fixedSize(vertical:)` then faithfully grew to fit the resulting
+            // wrap — which `lineLimit(2)` hid until "More" removed the cap and
+            // the banner shoved the rest of the window off screen.
             Text(text)
                 .font(.callout)
-                .lineLimit(expanded ? nil : 2)
+                // Expanded is still bounded. The message is a fixed template
+                // that needs three or four lines; a cap costs nothing and
+                // means a longer one can never break the layout again.
+                .lineLimit(expanded ? 8 : 2)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
             Button(expanded ? "Less" : "More") { withAnimation { expanded.toggle() } }
                 .buttonStyle(.plain).font(.caption.weight(.medium))
                 .foregroundStyle(Palette.pinned)
+                .fixedSize()
             Button("Dismiss", systemImage: "xmark") { withAnimation { dismiss() } }
                 .labelStyle(.iconOnly)
                 .buttonStyle(.plain)

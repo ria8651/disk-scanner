@@ -27,6 +27,33 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp app/.build/release/DiskScanner "$APP/Contents/MacOS/DiskScanner"
 
+# The icon is an Icon Composer document (assets/AppIcon.icon), which is what
+# macOS 26 wants: the system renders it as Liquid Glass and picks the light,
+# dark or tinted rendition itself rather than being handed one flat bitmap.
+#
+# Compiling it needs actool, from Xcode. Assets.car is what carries those
+# renditions, and CFBundleIconName is the key that points at them. Without
+# actool the build still works: assets/AppIcon.icns is checked in, and
+# CFBundleIconFile finds it -- the icon then looks right but stops responding
+# to appearance changes.
+ICON_KEYS="  <key>CFBundleIconFile</key><string>AppIcon</string>"
+cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+ACTOOL="$(xcrun --find actool 2>/dev/null || true)"
+if [ -n "$ACTOOL" ] && [ -d assets/AppIcon.icon ]; then
+  echo "==> actool: compiling assets/AppIcon.icon"
+  "$ACTOOL" --compile "$APP/Contents/Resources" \
+            --platform macosx --minimum-deployment-target 26.0 \
+            --app-icon AppIcon \
+            --output-partial-info-plist build/icon-partial.plist \
+            assets/AppIcon.icon > /dev/null
+  # actool writes its own 16pt/128pt-only .icns; ours covers every size.
+  cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+  ICON_KEYS="$ICON_KEYS
+  <key>CFBundleIconName</key><string>AppIcon</string>"
+else
+  echo "==> no actool: using assets/AppIcon.icns alone (no tinted/dark renditions)"
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -35,6 +62,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Disk Scanner</string>
   <key>CFBundleDisplayName</key><string>Disk Scanner</string>
   <key>CFBundleExecutable</key><string>DiskScanner</string>
+$ICON_KEYS
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <!-- Without NSPrincipalClass AppKit never bootstraps, and the process runs
