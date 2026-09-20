@@ -1,6 +1,6 @@
 [package]
 name = "disk-scanner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Fast macOS disk scanner with correct APFS clone, hardlink and snapshot accounting"
