@@ -19,6 +19,7 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod ffi;
 pub mod model;
 pub mod report;
 pub mod scan;

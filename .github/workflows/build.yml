@@ -1,0 +1,104 @@
+# Build DiskScanner.app on every push and PR, and attach it to tags.
+#
+# Free for public repositories: GitHub Actions standard runners, macOS
+# included, are unmetered on public repos. Only larger runners are billed.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-26 specifically: Package.swift declares .macOS(.v26) and
+    # swift-tools-version 6.2, so an older image fails while parsing the
+    # manifest, before it compiles anything.
+    runs-on: macos-26
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          cargo --version
+          sw_vers
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+
+      # Secrets are not exposed to workflows triggered from forked PRs, so
+      # this step no-ops there and build-app.sh falls back to ad-hoc signing.
+      # A fork's build still verifies that the code compiles, which is all a
+      # fork's build needs to do.
+      - name: Import signing certificate
+        id: cert
+        env:
+          CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          if [ -z "$CERT_P12" ]; then
+            echo "::notice::No signing certificate available; ad-hoc signing."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Default keychains re-lock after 5 minutes of inactivity and would
+          # lock mid-build; -lut 21600 outlives any plausible build.
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          # Without this, codesign blocks on a GUI authorisation prompt that
+          # nothing on a runner can answer, and the job hangs until timeout.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          # build-app.sh looks the certificate up by name, so the new keychain
+          # has to be in the search list, not merely to exist.
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '" ')
+
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: ./build-app.sh
+
+      - name: Show resulting signature
+        run: |
+          codesign -dv --requirements - build/DiskScanner.app 2>&1 | \
+            grep -E 'Signature|designated|Authority' || true
+
+      # actions/upload-artifact re-zips its input and preserves neither the
+      # executable bit nor symlinks, which corrupts an .app bundle and its
+      # signature. ditto writes a proper macOS archive; upload that instead
+      # and let the double-zip be the cost of doing business.
+      - name: Archive app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/DiskScanner.app "$RUNNER_TEMP/DiskScanner.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DiskScanner-${{ github.sha }}
+          path: ${{ runner.temp }}/DiskScanner.zip
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/DiskScanner.zip

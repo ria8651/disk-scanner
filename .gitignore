@@ -1,2 +1,12 @@
 /target
 .DS_Store
+
+# Swift front end
+/app/.build/
+/build/
+*.xcodeproj
+.swiftpm/
+
+# Signing identity — see make-cert.sh. Never commit these.
+*.p12
+*.pem

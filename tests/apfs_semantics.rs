@@ -321,3 +321,104 @@ fn paths_round_trip() {
     );
     assert_eq!(fs::metadata(&p).unwrap().len(), 1000);
 }
+
+// ---------------------------------------------------------------------------
+// Reclaim is a set property, not a sum.
+
+fn find_id(r: &disk_scanner::ScanResult, name: &str) -> u32 {
+    (0..r.tree.len() as u32)
+        .find(|&i| r.tree.name_str(i) == name)
+        .unwrap_or_else(|| panic!("no node named {name}"))
+}
+
+/// Deleting *some* clones of a family frees nothing; deleting *all* of them
+/// frees the shared blocks once. A scanner that sums `exclusive` reports zero
+/// for both cases, and one that sums `physical` reports 3x the truth.
+#[test]
+fn reclaim_needs_the_whole_clone_family() {
+    use disk_scanner::report::reclaim;
+
+    let t = tmp("reclaim-clone");
+    const SZ: u64 = 32 << 20;
+    let orig = t.0.join("orig.bin");
+    write_random(&orig, SZ as usize);
+    clone_file(&orig, &t.0.join("c1.bin"));
+    clone_file(&orig, &t.0.join("c2.bin"));
+
+    let r = run(&t.0);
+    let (a, b, c) = (
+        find_id(&r, "orig.bin"),
+        find_id(&r, "c1.bin"),
+        find_id(&r, "c2.bin"),
+    );
+
+    // One member: the other two keep every block alive.
+    let one = reclaim(&r, &[a]);
+    assert!(
+        one.bytes < SZ / 8,
+        "deleting 1 of 3 clones should free ~nothing, got {}",
+        one.bytes
+    );
+    assert!(
+        one.held_by_clones_outside >= SZ / 2,
+        "should report bytes held by unselected clones, got {}",
+        one.held_by_clones_outside
+    );
+
+    // Two members: still nothing, because the third holds the extents.
+    let two = reclaim(&r, &[a, b]);
+    assert!(
+        two.bytes < SZ / 8,
+        "deleting 2 of 3 clones should free ~nothing, got {}",
+        two.bytes
+    );
+
+    // All three: the family dies and the blocks come back — once.
+    let all = reclaim(&r, &[a, b, c]);
+    assert!(
+        all.bytes >= SZ / 2,
+        "deleting the whole family should free the shared blocks, got {}",
+        all.bytes
+    );
+    assert!(
+        all.bytes < SZ * 2,
+        "must free the blocks ONCE, not once per member, got {}",
+        all.bytes
+    );
+    assert_eq!(all.families_completed, 1);
+    assert_eq!(all.held_by_clones_outside, 0);
+}
+
+/// Selecting a directory is the same as selecting its contents, and
+/// overlapping selections must not double-count.
+#[test]
+fn reclaim_handles_subtrees_and_overlap() {
+    use disk_scanner::report::{reclaim, subtree_reclaim};
+
+    let t = tmp("reclaim-tree");
+    const SZ: u64 = 8 << 20;
+    let sub = t.0.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    write_random(&sub.join("a.bin"), SZ as usize);
+    write_random(&sub.join("b.bin"), SZ as usize);
+
+    let r = run(&t.0);
+    let dir = find_id(&r, "sub");
+    let a = find_id(&r, "a.bin");
+
+    let whole = subtree_reclaim(&r, dir);
+    assert_eq!(whole.files, 2);
+    assert!(
+        whole.bytes >= SZ * 2,
+        "two independent files should free both, got {}",
+        whole.bytes
+    );
+
+    // Selecting the directory *and* a file inside it must not count twice.
+    let overlap = reclaim(&r, &[dir, a]);
+    assert_eq!(
+        overlap.bytes, whole.bytes,
+        "overlapping selection double-counted"
+    );
+    assert_eq!(overlap.files, whole.files);
+}

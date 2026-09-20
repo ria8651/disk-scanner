@@ -5,6 +5,11 @@ edition = "2021"
 rust-version = "1.80"
 description = "Fast macOS disk scanner with correct APFS clone, hardlink and snapshot accounting"
 
+[lib]
+name = "disk_scanner"
+# rlib for the Rust tests and the demo CLI; staticlib for the Swift app.
+crate-type = ["rlib", "staticlib"]
+
 [dependencies]
 libc = "0.2"
 

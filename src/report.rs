@@ -129,3 +129,167 @@ pub fn reclaimable_from_clones(r: &ScanResult) -> (u64, usize, usize) {
     }
     (bytes, whole, r.families.len())
 }
+
+// ---------------------------------------------------------------------------
+// True reclaim: what deleting a *set* of things would actually free.
+//
+// This cannot be a sum. Three clones of a 64 MiB file each report
+// `exclusive == 0` and `shared_clones == 64 MiB`; summing the subtree says
+// "0 exclusive, 192 MiB shared" when the real answer for deleting all three
+// is 64 MiB, and for deleting any two of them is zero. Reclaim is therefore
+// a property of the selection as a whole, evaluated against clone families.
+
+use crate::model::{NodeId, Tree};
+use std::collections::{HashMap, HashSet};
+
+/// What deleting a selection would free, and what would survive it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reclaim {
+    /// Bytes actually freed, right now, by deleting everything selected.
+    pub bytes: u64,
+    /// Of `bytes`: blocks no one else referenced to begin with.
+    pub from_exclusive: u64,
+    /// Of `bytes`: clone-shared blocks released because *every* member of
+    /// those families is inside the selection.
+    pub from_completed_families: u64,
+    /// Clone families the selection covers completely.
+    pub families_completed: u32,
+    /// Clone-shared bytes NOT freed, because members live outside the
+    /// selection. Adding those members would convert this into `bytes`.
+    pub held_by_clones_outside: u64,
+    /// Bytes pinned by a snapshot or the sealed system volume. Deleting the
+    /// files does not free these at all, whatever else is selected.
+    pub pinned_by_snapshot: u64,
+    /// Allocated bytes covered by the selection (`du`'s answer for it).
+    pub physical: u64,
+    pub files: u64,
+    pub dirs: u64,
+    /// Unreadable nodes inside the selection: `bytes` is a lower bound.
+    pub unknown: u32,
+}
+
+impl Reclaim {
+    /// Fraction of covered allocation that deleting this selection frees.
+    pub fn efficiency(&self) -> f64 {
+        if self.physical == 0 {
+            0.0
+        } else {
+            self.bytes as f64 / self.physical as f64
+        }
+    }
+    /// The one-line honest summary for a UI footer.
+    pub fn summary(&self) -> String {
+        let mut s = format!("frees {}", human(self.bytes));
+        if self.held_by_clones_outside > 0 {
+            s.push_str(&format!(
+                "; {} more would need every clone selected too",
+                human(self.held_by_clones_outside)
+            ));
+        }
+        if self.pinned_by_snapshot > 0 {
+            s.push_str(&format!(
+                "; {} stays pinned by snapshots regardless",
+                human(self.pinned_by_snapshot)
+            ));
+        }
+        if self.unknown > 0 {
+            s.push_str(&format!("; {} unreadable — lower bound", self.unknown));
+        }
+        s
+    }
+}
+
+/// Bytes freed by deleting every node in `sel`, and their whole subtrees.
+///
+/// Overlapping selections are safe: a node reached twice (because both it and
+/// an ancestor were selected) is counted once.
+///
+/// **Hardlink caveat.** Additional links to an already-counted inode are
+/// folded to zero by the scanner, so selecting only an alias correctly frees
+/// nothing. The converse is not modelled: selecting the *first*-seen link of
+/// a multiply-linked file credits its full `exclusive` even though the other
+/// links keep the blocks alive. `Node` does not retain `linkcount`, so this
+/// cannot currently be detected after the fact.
+pub fn reclaim(r: &ScanResult, sel: &[NodeId]) -> Reclaim {
+    let t: &Tree = &r.tree;
+    let mut out = Reclaim::default();
+
+    // Drop any selection that already lies inside another selection. Once the
+    // remaining roots are disjoint their subtrees cannot overlap, so the walk
+    // needs no visited set at all — which is the whole cost at this scale:
+    // a per-node hash insert over millions of files, to guard against an
+    // overlap that a cheap ancestor check has already ruled out.
+    let set: HashSet<NodeId> = sel
+        .iter()
+        .copied()
+        .filter(|&n| (n as usize) < t.len())
+        .collect();
+    let mut roots: Vec<NodeId> = Vec::with_capacity(set.len());
+    for &n in &set {
+        let mut cur = n;
+        let mut covered = false;
+        // Depth, not breadth: a handful of steps up to the scan root.
+        loop {
+            let p = t.node(cur).parent;
+            if p == crate::model::NO_NODE || p == cur {
+                break;
+            }
+            if set.contains(&p) {
+                covered = true;
+                break;
+            }
+            cur = p;
+        }
+        if !covered {
+            roots.push(n);
+        }
+    }
+
+    // cloneid -> how many of that family the selection covers.
+    let mut fam_hits: HashMap<u64, u32> = HashMap::new();
+    let mut stack: Vec<NodeId> = roots;
+
+    while let Some(id) = stack.pop() {
+        let n = t.node(id);
+        for c in n.children() {
+            stack.push(c);
+        }
+        if !matches!(n.state(), crate::model::State::Ok) {
+            out.unknown += 1;
+        }
+        if n.is_dir() {
+            out.dirs += 1;
+            continue; // directory sizes are subtree rollups; the files carry them
+        }
+        if n.hardlink_alias {
+            continue; // already accounted for at the first link
+        }
+        out.files += 1;
+        out.physical += n.size.physical;
+        out.from_exclusive += n.size.exclusive;
+        out.pinned_by_snapshot += n.size.shared_snapshot;
+        if let Some(&cid) = r.clone_of.get(&id) {
+            *fam_hits.entry(cid).or_insert(0) += 1;
+        }
+    }
+
+    for (cid, hits) in fam_hits {
+        let Some(f) = r.families.get(&cid) else {
+            continue;
+        };
+        if hits >= f.refcnt {
+            out.from_completed_families += f.shared_bytes;
+            out.families_completed += 1;
+        } else {
+            out.held_by_clones_outside += f.shared_bytes;
+        }
+    }
+
+    out.bytes = out.from_exclusive + out.from_completed_families;
+    out
+}
+
+/// Reclaim for a single subtree — the number a directory row wants to show.
+pub fn subtree_reclaim(r: &ScanResult, node: NodeId) -> Reclaim {
+    reclaim(r, &[node])
+}

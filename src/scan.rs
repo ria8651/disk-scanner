@@ -83,6 +83,14 @@ pub struct ScanResult {
     pub skipped: Vec<(PathBuf, &'static str)>,
     /// Clone families, keyed by `ATTR_CMNEXT_CLONEID`.
     pub families: HashMap<u64, Family>,
+    /// Which clone family each clone member belongs to.
+    ///
+    /// A side table rather than a `Node` field on purpose: `Node` is already
+    /// 96 bytes and size-guarded by a test, and clone members are a small
+    /// minority of a whole-disk scan. Without this, `families` can be
+    /// summarised globally but never attributed to a subtree or a selection,
+    /// which is exactly what "what would deleting this actually free" needs.
+    pub clone_of: HashMap<NodeId, u64>,
     pub policies: iopolicy::Policies,
     /// `statfs`-reported used bytes for the root volume, for reconciliation.
     pub volume_used: u64,
@@ -170,6 +178,7 @@ struct Shared {
     tree: Mutex<Tree>,
     dedupe: Dedupe,
     families: Families,
+    clone_of: Mutex<HashMap<NodeId, u64>>,
     stats: Mutex<Stats>,
     allowed_devs: HashSet<libc::dev_t>,
     /// Mount points inside the root's own volume group. Their contents are
@@ -264,6 +273,8 @@ struct Pending {
     size: Sizes,
     hardlink_alias: bool,
     descend: bool,
+    /// `ATTR_CMNEXT_CLONEID`, or 0 when this entry is not a clone member.
+    cloneid: u64,
 }
 
 impl Shared {
@@ -314,6 +325,7 @@ impl Shared {
                             size: Sizes::default(),
                             hardlink_alias: false,
                             descend: false,
+                            cloneid: 0,
                         });
                         continue;
                     }
@@ -333,6 +345,7 @@ impl Shared {
 
         // One lock acquisition per directory; children land contiguously.
         let mut subdirs: Vec<Task> = Vec::new();
+        let mut clones: Vec<(NodeId, u64)> = Vec::new();
         {
             let mut tree = self.tree.lock().unwrap();
             let first = tree.len() as NodeId;
@@ -346,6 +359,9 @@ impl Shared {
                 n.mtime = c.mtime;
                 n.size = c.size;
                 n.hardlink_alias = c.hardlink_alias;
+                if c.cloneid != 0 {
+                    clones.push((id, c.cloneid));
+                }
                 if c.descend {
                     subdirs.push(Task {
                         id,
@@ -356,6 +372,11 @@ impl Shared {
             let p = &mut tree.nodes[task.id as usize];
             p.first_child = if count == 0 { NO_NODE } else { first };
             p.child_count = count;
+        }
+        // Merged after the tree lock is released: clone members are a small
+        // minority, so this lock is almost never contended.
+        if !clones.is_empty() {
+            self.clone_of.lock().unwrap().extend(clones);
         }
 
         self.p_dirs.fetch_add(local.dirs, Ordering::Relaxed);
@@ -406,6 +427,7 @@ impl Shared {
                 size: Sizes::default(),
                 hardlink_alias: false,
                 descend,
+                cloneid: 0,
             };
         }
 
@@ -422,6 +444,7 @@ impl Shared {
                 size: Sizes::default(),
                 hardlink_alias: false,
                 descend: false,
+                cloneid: 0,
             };
         }
 
@@ -437,6 +460,7 @@ impl Shared {
                 size: Sizes::default(),
                 hardlink_alias: false,
                 descend: false,
+                cloneid: 0,
             };
         }
 
@@ -463,7 +487,8 @@ impl Shared {
 
         let size = if alias { Sizes::default() } else { sizes_of(e) };
 
-        if !alias && e.shares_with_clones() {
+        let is_clone = !alias && e.shares_with_clones();
+        if is_clone {
             local.clone_members += 1;
             self.families
                 .record(e.cloneid, e.clone_refcnt, size.shared_clones);
@@ -480,6 +505,7 @@ impl Shared {
             size,
             hardlink_alias: alias,
             descend: false,
+            cloneid: if is_clone { e.cloneid } else { 0 },
         }
     }
 
@@ -570,6 +596,7 @@ pub fn scan(
         tree: Mutex::new(tree),
         dedupe: Dedupe::new(),
         families: Families::new(),
+        clone_of: Mutex::new(HashMap::new()),
         stats: Mutex::new(Stats::default()),
         allowed_devs,
         group_mounts,
@@ -632,6 +659,7 @@ pub fn scan(
         root_path: root,
         skipped,
         families: sh.families.drain(),
+        clone_of: sh.clone_of.into_inner().unwrap(),
         policies,
         volume_used,
         volume_total,

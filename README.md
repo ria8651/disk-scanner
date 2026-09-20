@@ -7,7 +7,8 @@ question has no single answer, and the ways it goes wrong are not edge cases —
 they are the normal state of a Mac. This crate measures the difference instead
 of averaging it away.
 
-Status: **MVP — scanning engine and data model only.** No UI, no deletion.
+Status: **Engine plus a native macOS front end.** Read-only — nothing is ever
+deleted; the app answers *what would happen if you did*.
 
 ## The problem, measured
 
@@ -64,12 +65,40 @@ discriminator was verified experimentally — a snapshot-pinned file reports
 `ext_flags == 0` and `clone_refcnt == 1`, a real clone reports
 `EF_MAY_SHARE_BLOCKS` and `refcnt > 1`.
 
+### The number that is not a sum
+
+Per-object sizes cannot answer "what do I get back if I delete this". Three
+clones of a 64 MiB file each report `exclusive == 0`; deleting any two of them
+frees nothing, and deleting all three frees 64 MiB once. Reclaim is therefore a
+property of a *selection*, evaluated against clone families:
+
+```rust
+use disk_scanner::report::reclaim;
+let r = reclaim(&scan, &[node_a, node_b, node_c]);
+r.bytes;                    // actually freed, right now
+r.held_by_clones_outside;   // would be freed too, if those clones were included
+r.pinned_by_snapshot;       // never freed by deleting files at all
+```
+
+`tests/apfs_semantics.rs` builds a real three-member clone family and asserts
+all three cases. Overlapping selections (a directory *and* something inside it)
+are counted once.
+
 Unreadable subtrees are represented explicitly (`State::DeniedTcc`,
 `DeniedPerm`, `Skipped`, `Error`) and an `unknown_below` count rolls up the
 tree, so no total silently pretends to be complete. `EPERM` (TCC — the user can
 fix it) is distinguished from `EACCES` (ownership — they cannot).
 
 ## Usage
+
+The app:
+
+```bash
+./build-app.sh               # builds the Rust staticlib + Swift front end
+open build/DiskScanner.app
+```
+
+The CLI:
 
 ```bash
 cargo build --release
@@ -110,6 +139,99 @@ certificate instead, and the grant survives rebuilds.
 For a CLI the grant belongs to the **hosting terminal**, not to this binary,
 because TCC evaluates the responsible process. `responsible_app_hint()` walks
 the process tree to the nearest `.app` to tell the user which one to add.
+
+## The app
+
+SwiftUI front end, Rust engine, joined by a hand-written C ABI
+(`src/ffi.rs` <-> `app/Sources/DiskScannerFFI/include/disk_scanner.h`).
+
+**Why a bundled `.app` and not a TUI.** TCC judges the *responsible process*,
+so a CLI's Full Disk Access grant belongs to whichever terminal launched it —
+which is confusing to explain and easy to get wrong. A signed app owns its own
+grant. `build-app.sh` signs with the same stable identity as `sign.sh`, for the
+same reason: an ad-hoc signature invalidates the grant on every rebuild while
+System Settings still shows the toggle as ON.
+
+**The tree never crosses the boundary.** 4.2M nodes and ~450 MB stay in Rust.
+Swift holds an opaque `DsScan *` and asks narrow questions — "children of node
+N sorted by allocated size", "treemap rectangles for node N at 900x600" —
+answered by filling a caller-allocated buffer of POD structs. No serialisation,
+no per-node bridging. That is also why the bridge is hand-written rather than
+`uniffi` or `swift-bridge`: the boundary is about twenty functions, and its hot
+path returns bulk arrays that want to be memcpy'd, not encoded.
+
+**The treemap derives its layout inside the `Canvas` renderer**, from the size
+`Canvas` itself supplies, rather than computing it in `onAppear`/`onChange` and
+pushing it through `@State`. The state-driven version was subtly broken: the
+rectangles would be ready and the view body would have re-evaluated, yet the
+map stayed blank until a mouse event forced a repaint — 11.7s on one measured
+run, instant on the next, because it depended on SwiftUI choosing to
+invalidate the Canvas. Layout is a pure function of (node, size), so computing
+it where the size is known and the paint is about to happen removes the gap by
+construction: any draw, at any size, already has the right geometry. It also
+sidesteps the speculative intermediate sizes (105x20, 105x0) that a
+`GeometryReader` reports while the layout settles, each of which used to
+trigger a discarded layout pass.
+
+**Treemap layout happens in Rust**, because it depends on child ordering and on
+the aggregation cutoff, both of which need the arena. Children too small to
+draw collapse into one `aggregated` block at their own level, so a directory
+with 100k entries produces a few hundred rectangles instead of 100k invisible
+ones.
+
+**Sibling gaps scale with the tiles they separate.** A fixed gap cannot work:
+3pt is invisible between two 200pt tiles and eats nearly half of a 6pt one, so
+a folder of many small files looked grotesquely over-spaced with the same
+constant that looked right everywhere else. Each group derives its gap from
+its own *median* tile — median, not mean, because treemap areas are
+heavy-tailed and one huge first child would otherwise talk a crowd of small
+ones into wide gaps — and the `gap` argument is a ceiling rather than a
+constant. Measured across groups from 8 to 1470 tiles, the absolute gap ranges
+0.69pt to 3.0pt while the gap-to-tile ratio stays between 9% and 15%.
+
+The layout is **recursive**, and that is the point: a one-level treemap answers
+"what is big in this folder", while a nested one answers "where does the weight
+actually sit" — which is the question someone opens a disk scanner with.
+Directories become frames holding their children; only blocks too small or too
+deep to subdivide are drawn solid, and those carry the colour encoding.
+Rectangles come back in **paint order** (pre-order), so a container always
+precedes the children drawn on top of it — which is also what makes "the last
+rectangle containing the point" the correct hit test.
+
+**A scan is mutable while it runs and immutable forever after.** `ds_scan_begin`
+spawns a thread and returns a cancellable handle; the finished `DsScan *`
+arrives through a completion callback. Nothing reads the tree while it is being
+built, which is why no lock appears in the FFI layer. Live treemap building
+would need incremental rollup, which `Tree::rollup`'s single reverse pass
+cannot do.
+
+**The palette is the argument.** Block area is allocated size; the solid core
+filled from the bottom is `exclusive`; the remainder is tinted by *why* it will
+not come back — cloned or snapshot-pinned. Three categories on screen, six
+numbers in the inspector.
+
+**Bars that carry text stay in layout flow.** `safeAreaBar` applied after
+`.inspector` wraps the whole split and floats over the toolbar, which made the
+snapshot banner unreadable. The banner and the selection bar both carry text
+and numbers, so they take real space in a `VStack` instead of floating.
+
+**Liquid Glass is chrome, never content.** macOS 26 glass is translucent and
+picks up whatever is behind the window, so putting it under the treemap would
+tint every block by the desktop and make the colours lie. Glass is used only on
+the layers that float *above* the data — toolbar, hover chip, snapshot banner,
+selection bar — and the map itself sits on a flat opaque surface. For the same
+reason the treemap does not extend under the toolbar: content scrolling beneath
+glass is the platform idiom, but a static map would simply have its top row
+permanently obscured.
+
+**Requires macOS 26.** The front end is built against the Liquid Glass APIs
+(`glassEffect`, `GlassEffectContainer`, `ToolbarSpacer`, `inspector`,
+`safeAreaBar`, `scrollEdgeEffectStyle`); the engine and CLI have no such
+floor.
+
+**ABI drift is a compile error.** The header carries `_Static_assert`s on every
+struct size, checked against the `ffi::abi::layout` test. Change one side only
+and the Swift build fails instead of silently reading garbage.
 
 ## Design notes worth knowing before editing
 
@@ -154,6 +276,12 @@ thread scope, so a per-worker call protects nothing.
   most of its extents. Family totals are therefore a **bound**, not an exact
   figure. Exact answers need extent-level enumeration (`F_LOG2PHYS_EXT`), which
   requires opening every file and is far slower.
+- **Reclaim over-credits the first link of a hardlinked file.** Extra links are
+  folded to zero, so selecting an alias correctly frees nothing; but selecting
+  the *first*-seen link credits its full `exclusive` even though the other
+  links keep the blocks alive. `Node` does not retain `linkcount`, so this
+  cannot be detected after the walk. Clone families, the far more common case
+  on APFS, are handled exactly.
 - **Not verified:** whether `opendir` on a TCC-protected folder fails outright
   or succeeds with only per-file `open()` denied. The development machine had
   FDA granted, so no denial could be produced. The scanner assumes the
