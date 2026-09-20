@@ -65,10 +65,16 @@ echo "==> generating certificate (20 year validity)"
 openssl req -x509 -newkey rsa:2048 -nodes -days 7300 \
   -keyout "$TMP/key.pem" -out "$TMP/cert.pem" -config "$TMP/cert.cnf" 2>/dev/null
 
-# A password is mandatory: `security import` cannot read a .p12 with an empty
-# one. It is not a secret in any meaningful sense (the file itself is), so it
-# is fixed rather than prompted, and travels beside the .p12 into CI.
-P12_PASSWORD="${DSCAN_P12_PASSWORD:-disk-scanner}"
+# PKCS#12 cannot have an empty password -- `security import` refuses to read
+# such a file -- so one is unavoidable. It is deliberately a FIXED, PUBLISHED
+# value rather than a secret, and the workflows hardcode the same string.
+#
+# The private key inside the .p12 is the thing worth protecting; a password
+# kept in the same place as the file it locks protects nothing, and a second
+# secret is a second thing to get wrong (it already cost one failed release).
+# Keep the .p12 out of the repo and out of anywhere public; the password may
+# live wherever it likes.
+P12_PASSWORD="disk-scanner"
 
 # -keypbe/-certpbe/-macalg: OpenSSL 3 defaults to AES-256-CBC + PBKDF2, which
 # Apple's Security framework cannot parse — `security import` fails with
@@ -108,12 +114,14 @@ Full Disk Access grant survives them. That is the entire point.
 Next:
   ./build-app.sh                       build and sign locally
 
-For CI, add two repository secrets (Settings > Secrets and variables > Actions):
+For CI, add ONE repository secret (Settings > Secrets and variables > Actions):
   SIGNING_CERT_P12        openssl base64 -A -in $P12 | pbcopy   (then paste)
-                          (openssl rather than base64(1): Homebrew's base64
-                          shadows /usr/bin/base64 and rejects -i, and -A
-                          guarantees one unwrapped line)
-  SIGNING_CERT_PASSWORD   $P12_PASSWORD
+
+(openssl rather than base64(1): Homebrew's base64 shadows /usr/bin/base64 and
+rejects -i, and -A guarantees one unwrapped line.)
+
+The .p12 password is not a secret -- it is "$P12_PASSWORD", hardcoded here and
+in .github/workflows/. The key is the secret.
 
 !! BACK UP $P12 SOMEWHERE SAFE (password manager, encrypted backup).
 !! If you lose it you must issue a new certificate, which changes the
