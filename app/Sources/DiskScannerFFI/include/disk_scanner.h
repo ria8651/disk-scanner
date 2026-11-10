@@ -120,8 +120,9 @@ typedef struct {
   int64_t delta;  // walked - used; positive means clones were over-counted
 } DsReconcile;
 
-typedef struct DsScan DsScan;  // a finished, immutable scan
-typedef struct DsJob DsJob;    // a scan in flight
+typedef struct DsScan DsScan;    // a finished scan; changed only by ds_refresh_apply
+typedef struct DsJob DsJob;      // a scan in flight
+typedef struct DsPatch DsPatch;  // re-listed folders, not yet grafted
 
 // Both callbacks arrive on the scan thread, NOT the main thread.
 typedef void (*DsProgressFn)(void *ctx, uint64_t dirs, uint64_t files, uint64_t physical);
@@ -194,6 +195,34 @@ bool ds_skipped(const DsScan *scan, size_t index, char *path, size_t path_cap,
                 char *reason, size_t reason_cap);
 
 size_t ds_human(uint64_t bytes, char *buf, size_t cap);
+
+// --- keeping a scan current ----------------------------------------------
+// One primitive: re-list a folder whose contents changed. Existing subfolders
+// (same name AND inode) keep their subtrees; only new ones are walked.
+//
+// prepare does the I/O and only reads the scan: it may run on another thread
+// while readers continue, but never concurrently with apply. apply mutates
+// and INVALIDATES NODE IDS: re-resolve anything held with ds_lookup.
+
+// Node at `path`; with `nearest`, the deepest existing node on the way to it.
+// DS_NO_NODE if outside the scan.
+uint32_t ds_lookup(const DsScan *scan, const char *path, bool nearest);
+// One folder per patch: each must be prepared against the tree the previous
+// apply left. NULL if the scan does not hold the folder.
+DsPatch *ds_refresh_prepare(const DsScan *scan, const char *path);
+// Frees patch. False if it no longer applied (folder gone, or another patch
+// was applied since it was prepared).
+bool ds_refresh_apply(DsScan *scan, DsPatch *patch);
+// Whether prepare would re-list `path`. Cheap: drop gone folders with it
+// before paying for a prepare.
+bool ds_refresh_holds(const DsScan *scan, const char *path);
+void ds_patch_free(DsPatch *patch);  // discard without applying
+// Pop a folder an apply found stale but could not re-list itself; prepare it
+// next. Returns the length needed, 0 when none; pops only when it fits.
+size_t ds_refresh_followup(DsScan *scan, char *buf, size_t cap);
+// Folders refreshed since the walk; >0 means clone/hardlink figures outside
+// them may be stale until a full rescan.
+uint32_t ds_refresh_count(const DsScan *scan);
 
 // --- ABI guards ------------------------------------------------------------
 // If any of these fire, src/ffi.rs and this header have drifted apart.

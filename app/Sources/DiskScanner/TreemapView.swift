@@ -17,11 +17,13 @@ import SwiftUI
 final class TreemapLayout {
     private var node: UInt32 = .max
     private var size: CGSize = .zero
+    private var revision = -1
     private(set) var rects: [DsRect] = []
 
-    func rects(node: UInt32, size: CGSize, scan: Scan) -> [DsRect] {
+    func rects(node: UInt32, size: CGSize, revision: Int, scan: Scan) -> [DsRect] {
         guard size.width > 1, size.height > 1 else { return [] }
-        if node == self.node, abs(size.width - self.size.width) < 0.5,
+        if node == self.node, revision == self.revision,
+            abs(size.width - self.size.width) < 0.5,
             abs(size.height - self.size.height) < 0.5
         {
             return rects
@@ -29,6 +31,7 @@ final class TreemapLayout {
         let t = Date()
         self.node = node
         self.size = size
+        self.revision = revision
         rects = scan.treemap(of: node, size: size)
         Diag.slow("treemap layout \(rects.count) rects", t)
         return rects
@@ -46,6 +49,8 @@ struct TreemapView: View {
     let model: ScanModel
     let scan: Scan
     let node: UInt32
+    /// `ScanModel.revision`, passed in so a refresh re-lays the map.
+    let revision: Int
 
     @State private var layout = TreemapLayout()
     @State private var hoverIndex: Int?
@@ -60,7 +65,7 @@ struct TreemapView: View {
         // is the only size that matters and is never one of the speculative
         // intermediate sizes a GeometryReader reports during layout passes.
         Canvas(opaque: false) { ctx, size in
-            let rects = layout.rects(node: node, size: size, scan: scan)
+            let rects = layout.rects(node: node, size: size, revision: revision, scan: scan)
             let t = Date()
             // Paint order is the array order: a container is always drawn
             // before the children that sit on top of it.
@@ -84,6 +89,8 @@ struct TreemapView: View {
             case .ended: hoverIndex = nil
             }
         }
+        // An index into the old rects means nothing in the new ones.
+        .onChange(of: revision) { hoverIndex = nil }
         // ONE tap gesture. Registering `count: 2` as well forces every single
         // click to wait out the system double-click interval (~0.5s) before it
         // can commit, because the recogniser has to rule out a second click
@@ -149,22 +156,26 @@ struct TreemapView: View {
     private func nodeMenuItems(for node: UInt32) -> some View {
         let picked = model.selection.contains(node)
         let row = scan.row(node)
+        // By path, as in `nodeMenu`: a refresh may renumber while it is open.
+        let path = scan.path(node)
         Button("Reveal in Finder", systemImage: "magnifyingglass") {
-            revealInFinder(scan.path(node))
+            revealInFinder(path)
         }
         if let row, row.kind == DS_KIND_DIR, row.child_count > 0 {
-            Button("Show in Map", systemImage: "square.grid.3x3") { model.open(node) }
+            Button("Show in Map", systemImage: "square.grid.3x3") {
+                if let n = model.node(at: path) { model.open(n) }
+            }
         }
         Divider()
         Button(
             picked ? "Remove from Selection" : "Add to Selection",
             systemImage: picked ? "minus.circle" : "checkmark.circle"
-        ) { model.toggle(node) }
+        ) { if let n = model.node(at: path) { model.toggle(n) } }
         Divider()
         Button("Copy Path", systemImage: "document.on.document") {
             let pb = NSPasteboard.general
             pb.clearContents()
-            pb.setString(scan.path(node), forType: .string)
+            pb.setString(path, forType: .string)
         }
     }
 

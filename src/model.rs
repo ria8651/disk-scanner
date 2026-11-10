@@ -48,6 +48,16 @@ impl Sizes {
         self.shared_snapshot += o.shared_snapshot;
         self.sparse_saving += o.sparse_saving;
     }
+    /// Undo an earlier `add`. Saturating, so a stale figure clamps at zero
+    /// rather than wrapping to sixteen exabytes.
+    pub fn sub(&mut self, o: &Sizes) {
+        self.logical = self.logical.saturating_sub(o.logical);
+        self.physical = self.physical.saturating_sub(o.physical);
+        self.exclusive = self.exclusive.saturating_sub(o.exclusive);
+        self.shared_clones = self.shared_clones.saturating_sub(o.shared_clones);
+        self.shared_snapshot = self.shared_snapshot.saturating_sub(o.shared_snapshot);
+        self.sparse_saving = self.sparse_saving.saturating_sub(o.sparse_saving);
+    }
     /// Total bytes this object shares with something else.
     pub fn shared(&self) -> u64 {
         self.shared_clones + self.shared_snapshot
@@ -102,6 +112,9 @@ pub struct Node {
     /// True when this is an additional hard link to an inode already counted
     /// elsewhere in the scan. Its sizes are zero so totals stay correct.
     pub hardlink_alias: bool,
+    /// Low 32 bits of the file id. Lets a refresh tell a folder it already
+    /// holds from a new one that took its name. Fits in existing padding.
+    pub ino: u32,
     pub mtime: i64,
     /// Own size for files; whole-subtree total for directories after rollup.
     pub size: Sizes,
@@ -164,6 +177,10 @@ pub(crate) fn state_code(s: State) -> u8 {
 /// Invariant relied upon by `rollup`: a node's index is always lower than any
 /// of its children's, because children are appended when the parent is
 /// expanded. That makes a single reverse pass a correct post-order traversal.
+///
+/// It holds for a fresh walk and after `compact`, **not** after a refresh,
+/// which moves a kept folder's node past its children (see `refresh`).
+/// Nothing rolls up a finished scan; compact before anything that would.
 #[derive(Default)]
 pub struct Tree {
     pub nodes: Vec<Node>,
@@ -223,10 +240,81 @@ impl Tree {
             flags: 0,
             ext_flags: 0,
             hardlink_alias: false,
+            ino: 0,
             mtime: 0,
             size: Sizes::default(),
         });
         id
+    }
+
+    /// Append a copy of `n` named `name`, links untouched: the caller remaps
+    /// them. Keeps the parent-before-child ordering `rollup` needs only if
+    /// the copy's parent and children are placed accordingly; `compact` does,
+    /// `refresh` deliberately does not.
+    pub(crate) fn push_copy(&mut self, mut n: Node, name: &[u8]) -> NodeId {
+        n.name_off = self.names.len() as u32;
+        n.name_len = name.len() as u16;
+        self.names.extend_from_slice(name);
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(n);
+        id
+    }
+
+    /// True if `id` is still reachable from the root. A refresh re-homes a
+    /// folder's children, leaving the old slots in the arena but unlinked;
+    /// this tells the two apart in a few steps up the parent chain.
+    pub fn is_live(&self, id: NodeId) -> bool {
+        let mut cur = id;
+        loop {
+            let Some(n) = self.nodes.get(cur as usize) else {
+                return false;
+            };
+            if cur == ROOT {
+                return true;
+            }
+            let p = n.parent;
+            if p == NO_NODE || p == cur || (p as usize) >= self.nodes.len() {
+                return false;
+            }
+            if !self.nodes[p as usize].children().contains(&cur) {
+                return false;
+            }
+            cur = p;
+        }
+    }
+
+    /// Rebuild the arena from what the root can still reach, breadth first.
+    ///
+    /// Returns old id -> new id, `NO_NODE` for anything dropped. Every id
+    /// changes, so callers holding ids must re-resolve them (by path).
+    pub fn compact(&mut self) -> Vec<NodeId> {
+        let mut remap = vec![NO_NODE; self.nodes.len()];
+        if self.nodes.is_empty() {
+            return remap;
+        }
+        let mut out = Tree::with_capacity(self.nodes.len() / 2);
+        // `order[i]` is the old id of new node `i`.
+        let mut order: Vec<NodeId> = vec![ROOT];
+        out.push_copy(self.nodes[0], self.name(ROOT));
+        remap[0] = ROOT;
+        let mut i = 0;
+        while i < order.len() {
+            let old = self.nodes[order[i] as usize];
+            if old.child_count > 0 {
+                let first = out.len() as NodeId;
+                for c in old.children() {
+                    let mut n = self.nodes[c as usize];
+                    n.parent = i as NodeId;
+                    remap[c as usize] = out.push_copy(n, self.name(c));
+                    order.push(c);
+                }
+                out.nodes[i].first_child = first;
+            }
+            i += 1;
+        }
+        out.shrink();
+        *self = out;
+        remap
     }
 
     /// Absolute path of a node, rebuilt by walking parent links.
@@ -318,5 +406,33 @@ mod tests {
         }
         t.rollup();
         assert_eq!(t.node(ROOT).size.physical, 999);
+    }
+
+    #[test]
+    fn compact_drops_unreachable_and_keeps_order() {
+        let mut t = Tree::new();
+        t.push(b"/", NO_NODE, Kind::Dir, State::Ok);
+        let a = t.push(b"a", ROOT, Kind::Dir, State::Ok);
+        let b = t.push(b"b", ROOT, Kind::File, State::Ok);
+        t.nodes[0].first_child = a;
+        t.nodes[0].child_count = 2;
+        // `a` re-homed its only child: the old slot `x` is garbage.
+        let x = t.push(b"x", a, Kind::File, State::Ok);
+        let y = t.push(b"y", a, Kind::File, State::Ok);
+        t.nodes[a as usize].first_child = y;
+        t.nodes[a as usize].child_count = 1;
+        assert!(!t.is_live(x));
+        assert!(t.is_live(y));
+
+        let remap = t.compact();
+        assert_eq!(t.len(), 4);
+        assert_eq!(remap[x as usize], NO_NODE);
+        let ny = remap[y as usize];
+        assert_eq!(t.name(ny), b"y");
+        assert_eq!(t.path(ny), PathBuf::from("/a/y"));
+        assert_eq!(t.name(remap[b as usize]), b"b");
+        for i in 1..t.len() {
+            assert!((t.nodes[i].parent as usize) < i);
+        }
     }
 }

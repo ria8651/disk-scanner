@@ -204,12 +204,26 @@ Rectangles come back in **paint order** (pre-order), so a container always
 precedes the children drawn on top of it — which is also what makes "the last
 rectangle containing the point" the correct hit test.
 
-**A scan is mutable while it runs and immutable forever after.** `ds_scan_begin`
-spawns a thread and returns a cancellable handle; the finished `DsScan *`
-arrives through a completion callback. Nothing reads the tree while it is being
-built, which is why no lock appears in the FFI layer. Live treemap building
-would need incremental rollup, which `Tree::rollup`'s single reverse pass
-cannot do.
+**A scan is mutable while it runs.** `ds_scan_begin` spawns a thread and
+returns a cancellable handle; the finished `DsScan *` arrives through a
+completion callback. Nothing reads the tree while it is being built, which is
+why no lock appears in the FFI layer. Live treemap building would need
+incremental rollup, which `Tree::rollup`'s single reverse pass cannot do.
+
+**After that it is kept current, not rescanned.** An FSEvents stream on the
+scan root (started with the walk, so nothing slips by during it) names the
+folders whose listings changed — a file moved to the Trash, a download
+landing. Each is re-listed in place (`src/refresh.rs`): its files are read
+again, its existing subfolders keep the subtrees already held, and only new
+subfolders are walked. The new listing is appended to the arena and the folder
+re-pointed at it, so the cost is the size of the change, not of the disk. The
+I/O half (`ds_refresh_prepare`) only reads the tree and runs off the main
+thread; the graft (`ds_refresh_apply`) is the only writer and runs on it, one
+folder at a time, which keeps the no-lock rule — and keeps it right, since
+each folder is re-listed against the tree the previous graft left. A folder
+replaced by a new one of the same name is told apart by inode and walked
+afresh. Node ids do not survive a graft; the app re-resolves the ones it
+holds by path.
 
 **The palette is the argument.** Block area is allocated size; the solid core
 filled from the bottom is `exclusive`; the remainder is tinted by *why* it will
@@ -294,6 +308,11 @@ thread scope, so a per-worker call protects nothing.
   conservative case (subtree opaque, marked `Denied`), which is correct either
   way, but the optimistic case would let us report sizes without the grant.
   Worth testing from a terminal without FDA.
+- **Live updates cannot see a change's effect on clones elsewhere.** Deleting
+  one clone raises what its siblings would free; when those siblings sit
+  outside every folder a refresh re-listed, their figures lag until a full
+  rescan, and the inspector says so. Hardlinks are kept exact. If FSEvents
+  drops events, the inspector asks for a rescan outright.
 - Whole-disk arena is ~400-500 MB for 4.2M nodes. `Node` is size-guarded by a
   test; the obvious further trim is moving the three `shared_*` fields to a
   directory-only side table.

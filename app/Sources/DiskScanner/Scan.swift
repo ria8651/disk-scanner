@@ -18,6 +18,20 @@ struct ScanHandle: @unchecked Sendable {
     let p: OpaquePointer
 }
 
+/// A prepared refresh crossing from its worker back to the main actor, owned
+/// by exactly one side at a time — the same shape of promise as `ScanHandle`.
+struct PatchHandle: @unchecked Sendable {
+    let p: OpaquePointer
+    func discard() { ds_patch_free(p) }
+}
+
+/// Lets a refresh worker keep the scan alive while it reads. Unchecked: the
+/// worker only calls `prepare`, which only reads, and `ScanModel` never
+/// applies while a worker is running.
+private struct ScanRef: @unchecked Sendable {
+    let scan: Scan
+}
+
 private final class Callbacks: @unchecked Sendable {
     let progress: @Sendable (UInt64, UInt64, UInt64) -> Void
     let done: @Sendable (ScanHandle?, String?) -> Void
@@ -65,12 +79,18 @@ enum SortKey: Int32, CaseIterable, Identifiable {
 //
 // Wraps the opaque `DsScan *`. Every accessor is a narrow question answered
 // into a caller-allocated buffer; the 4.2M-node arena never crosses.
+//
+// The tree changes only through `apply`, on the main actor. Node ids do not
+// survive it; `ScanModel` re-resolves the ones it holds by path.
 
 final class Scan {
     fileprivate let handle: OpaquePointer
-    let summary: DsSummary
-    let snapshotNote: String
-    let reconcileNote: String
+    private(set) var summary = DsSummary()
+    private(set) var snapshotNote = ""
+    private(set) var reconcileNote = ""
+    /// Folders re-listed since the walk. Non-zero means clone figures
+    /// outside them may be stale.
+    private(set) var refreshes: UInt32 = 0
     let skippedMounts: [(path: String, reason: String)]
     private var reclaimCache: [UInt32: DsReclaim] = [:]
 
@@ -78,16 +98,65 @@ final class Scan {
         let t = Date()
         defer { Diag.slow("Scan.init", t) }
         self.handle = handle
-        var s = DsSummary()
-        ds_summary(handle, &s)
-        summary = s
-        snapshotNote = cString(2048) { ds_snapshot_hint(handle, $0, $1) }
-        reconcileNote = cString(2048) { ds_reconcile_text(handle, $0, $1) }
         skippedMounts = (0..<ds_skipped_count(handle)).map { i in
             var p = [CChar](repeating: 0, count: 1024)
             var r = [CChar](repeating: 0, count: 256)
             ds_skipped(handle, i, &p, 1024, &r, 256)
             return (decodeCString(p), decodeCString(r))
+        }
+        reloadDerived()
+    }
+
+    /// Everything read once and cached, re-read after the tree changes.
+    private func reloadDerived() {
+        var s = DsSummary()
+        ds_summary(handle, &s)
+        summary = s
+        snapshotNote = cString(2048) { ds_snapshot_hint(handle, $0, $1) }
+        reconcileNote = cString(2048) { ds_reconcile_text(handle, $0, $1) }
+        refreshes = ds_refresh_count(handle)
+        reclaimCache = [:]
+    }
+
+    // MARK: refresh
+
+    /// The node at `path`; with `nearest`, the deepest one on the way there.
+    func lookup(_ path: String, nearest: Bool = false) -> UInt32? {
+        let n = path.withCString { ds_lookup(handle, $0, nearest) }
+        return n == DS_NO_NODE ? nil : n
+    }
+
+    /// Re-list one folder. Blocking I/O that only reads the tree: call it off
+    /// the main actor, and never while an `apply` could run. nil if the scan
+    /// does not hold the folder.
+    func prepare(_ dir: String) -> PatchHandle? {
+        dir.withCString { ds_refresh_prepare(handle, $0) }.map(PatchHandle.init)
+    }
+
+    /// Graft a prepared patch. Invalidates node ids when it returns true.
+    func apply(_ patch: PatchHandle) -> Bool {
+        let ok = ds_refresh_apply(handle, patch.p)
+        if ok { reloadDerived() }
+        return ok
+    }
+
+    /// Whether `prepare` would re-list `dir`. Cheap.
+    func holds(_ dir: String) -> Bool {
+        dir.withCString { ds_refresh_holds(handle, $0) }
+    }
+
+    /// Folders an apply found stale but could not re-list itself.
+    func takeFollowups() -> [String] {
+        var out: [String] = []
+        while true {
+            var buf = [CChar](repeating: 0, count: 1024)
+            var n = ds_refresh_followup(handle, &buf, buf.count)
+            if n >= buf.count {
+                buf = [CChar](repeating: 0, count: n + 1)
+                n = ds_refresh_followup(handle, &buf, buf.count)
+            }
+            if n == 0 { return out }
+            out.append(decodeCString(buf))
         }
     }
 
@@ -214,9 +283,23 @@ final class ScanModel {
     var selection: Set<UInt32> = []
     var sort: SortKey = .physical
     var showInspector = true
+    /// Bumped whenever the tree changes under the views. `Scan` is not
+    /// observable, so anything that draws from it reads this to redraw.
+    private(set) var revision = 0
+    /// Set when change events were lost, so the live figures can no longer be
+    /// trusted to be complete. Cleared by a full scan.
+    private(set) var missedChanges = false
 
     private var job: OpaquePointer?
     private var generation = 0
+    @ObservationIgnored private var watcher: FolderWatcher?
+    /// Folders waiting to be re-listed, bucketed by depth. Collected while a
+    /// scan or a refresh is running and drained one at a time after,
+    /// shallowest first. Buckets make "shallowest" cheap: a deleted tree can
+    /// queue tens of thousands of folders, and scanning them all on every
+    /// pick was quadratic.
+    @ObservationIgnored private var dirty = DirtyQueue()
+    @ObservationIgnored private var refreshing = false
     /// Counted so a frozen-looking scan can be told from a silent one.
     private var progressTicks = 0
 
@@ -231,6 +314,9 @@ final class ScanModel {
     @ObservationIgnored private var reclaimMemo: (sel: Set<UInt32>, value: DsReclaim)?
 
     var reclaim: DsReclaim {
+        // Read so the footer redraws when a refresh changes sizes under an
+        // unchanged selection.
+        _ = revision
         guard let scan else { return DsReclaim() }
         if let m = reclaimMemo, m.sel == selection { return m.value }
         let r = scan.reclaim(selection)
@@ -255,6 +341,13 @@ final class ScanModel {
 
         generation &+= 1
         let gen = generation
+
+        // Before the walk, so nothing that changes during it slips by.
+        stopWatching()
+        missedChanges = false
+        watcher = FolderWatcher(root: path) { [weak self] dirs, lost in
+            self?.noteChanges(dirs, lost: lost)
+        }
 
         Diag.mark("scan begin \(path)")
         progressTicks = 0
@@ -283,6 +376,7 @@ final class ScanModel {
         }
         if job == nil {
             Unmanaged<Callbacks>.fromOpaque(ctx).release()
+            stopWatching()
             phase = .failed("could not start a scan of \(path)")
         }
     }
@@ -299,15 +393,21 @@ final class ScanModel {
             job = nil
         }
         guard let handle else {
+            // Nothing to keep current, and `pumpRefresh` would never drain.
+            stopWatching()
             phase = .failed(err ?? "scan failed")
             return
         }
         let s = Scan(handle.p)
         scan = s
+        // A stopped scan has folders it never opened; re-listing one would
+        // fill it in while the rest stay empty. Nothing sound to keep current.
+        if s.summary.cancelled != 0 { stopWatching() }
         Diag.mark("phase -> ready")
         cursor = s.root
         focus = nil
         phase = .ready
+        pumpRefresh()
     }
 
     func cancel() {
@@ -321,12 +421,100 @@ final class ScanModel {
     /// instead of dragging the user into a scan they walked away from.
     func newScan() {
         cancel()
+        stopWatching()
         generation &+= 1
         scan = nil
         selection = []
         focus = nil
         cursor = 0
         phase = .idle
+    }
+
+    // MARK: live updates
+
+    /// The node at `path` now. For anything that captured a node earlier and
+    /// acts later — an open context menu — across a refresh that may have
+    /// renumbered everything in between.
+    func node(at path: String) -> UInt32? {
+        scan?.lookup(path)
+    }
+
+    private func stopWatching() {
+        watcher?.stop()
+        watcher = nil
+        dirty = DirtyQueue()
+    }
+
+    private func noteChanges(_ dirs: Set<String>, lost: Bool) {
+        if lost { missedChanges = true }
+        dirty.insert(dirs)
+        pumpRefresh()
+    }
+
+    /// Re-list whatever changed, one folder in flight at a time.
+    ///
+    /// One at a time is what makes this safe without locks: `prepare` reads
+    /// the tree on a worker while views read it here, and `apply` — the only
+    /// writer — runs here only after that worker is done. It is also what
+    /// makes it correct: each folder is prepared against the tree the last
+    /// apply left (see `refresh::Patch`).
+    ///
+    /// Shallowest first, so a parent that walks a new subfolder in full goes
+    /// before that subfolder's own event, which then costs only a re-list.
+    private func pumpRefresh() {
+        guard phase == .ready, let scan, !refreshing else { return }
+        // Folders already gone are dropped here, without a trip to a worker:
+        // their parent's re-listing is what removes them.
+        var picked: String?
+        while let d = dirty.popShallowest() {
+            if scan.holds(d) {
+                picked = d
+                break
+            }
+        }
+        guard let next = picked else { return }
+        refreshing = true
+        let gen = generation
+        let ref = ScanRef(scan: scan)
+        Diag.mark("refresh \(next)")
+        Task.detached(priority: .utility) { [weak self] in
+            let patch = ref.scan.prepare(next)
+            await MainActor.run {
+                guard let self else {
+                    patch?.discard()
+                    return
+                }
+                self.finishRefresh(patch, ref.scan, gen)
+            }
+        }
+    }
+
+    private func finishRefresh(_ patch: PatchHandle?, _ target: Scan, _ gen: Int) {
+        refreshing = false
+        defer { pumpRefresh() }
+        guard let patch else { return }
+        guard gen == generation, let s = scan, s === target else {
+            patch.discard()
+            return
+        }
+        // Ids are about to be invalidated: remember what they pointed at.
+        let cursorPath = s.path(cursor)
+        let focusPath = focus.map(s.path)
+        let picked = selection.map(s.path)
+
+        let t = Date()
+        let changed = s.apply(patch)
+        Diag.slow("refresh apply", t)
+        Diag.mark("refreshed: \(changed); root now \(s.summary.root.physical.formattedBytes)")
+        guard changed else { return }
+        dirty.insert(s.takeFollowups())
+
+        cursor = s.lookup(cursorPath, nearest: true) ?? s.root
+        focus = focusPath.flatMap { s.lookup($0) }
+        highlighted = nil
+        selection = Set(picked.compactMap { s.lookup($0) })
+        reclaimMemo = nil
+        revision &+= 1
     }
 
     var canRescan: Bool {
@@ -383,5 +571,24 @@ final class ScanModel {
 
     func clearSelection() {
         withAnimation(Self.selectionChange) { selection = [] }
+    }
+}
+
+/// Folders to re-list, deduplicated and bucketed by depth.
+struct DirtyQueue {
+    private var byDepth: [Int: Set<String>] = [:]
+
+    mutating func insert(_ dirs: some Sequence<String>) {
+        for d in dirs {
+            byDepth[d.utf8.reduce(0) { $1 == UInt8(ascii: "/") ? $0 + 1 : $0 }, default: []]
+                .insert(d)
+        }
+    }
+
+    mutating func popShallowest() -> String? {
+        guard let depth = byDepth.keys.min() else { return nil }
+        let d = byDepth[depth]!.removeFirst()
+        if byDepth[depth]!.isEmpty { byDepth[depth] = nil }
+        return d
     }
 }

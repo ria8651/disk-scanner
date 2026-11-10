@@ -11,6 +11,10 @@ struct InspectorView: View {
     private var target: UInt32 { model.focus ?? model.cursor }
 
     var body: some View {
+        // Passed down rather than read in each section: the sections hold the
+        // same `scan` and `node` before and after a refresh, so without a
+        // changed input SwiftUI would keep their old bodies.
+        let rev = model.revision
         Form {
             if let row = scan.row(target) {
                 Section {
@@ -18,12 +22,18 @@ struct InspectorView: View {
                         .nodeMenu(target, model: model, scan: scan)
                 }
                 Section("Size") { SizeSection(size: row.size) }
-                Section("If you deleted this") { ReclaimSection(scan: scan, node: target) }
+                Section("If you deleted this") {
+                    ReclaimSection(scan: scan, node: target, revision: rev)
+                }
                 if row.child_count > 0 {
-                    Section("Contents") { ContentsSection(model: model, scan: scan, node: target) }
+                    Section("Contents") {
+                        ContentsSection(model: model, scan: scan, node: target, revision: rev)
+                    }
                 }
             }
-            Section("Scan") { ScanSection(scan: scan) }
+            Section("Scan") {
+                ScanSection(scan: scan, revision: rev, missedChanges: model.missedChanges)
+            }
         }
         .formStyle(.grouped)
         .scrollEdgeEffectStyle(.soft, for: .top)
@@ -168,6 +178,7 @@ private struct StackedBar: View {
 private struct ReclaimSection: View {
     let scan: Scan
     let node: UInt32
+    let revision: Int
 
     private func timedReclaim() -> DsReclaim {
         let t = Date()
@@ -229,6 +240,7 @@ private struct ContentsSection: View {
     let model: ScanModel
     let scan: Scan
     let node: UInt32
+    let revision: Int
 
     var body: some View {
         let rows = scan.children(of: node, sort: model.sort, limit: 60)
@@ -301,9 +313,25 @@ private struct ContentsSection: View {
 
 private struct ScanSection: View {
     let scan: Scan
+    let revision: Int
+    let missedChanges: Bool
 
     var body: some View {
         let s = scan.summary
+        if missedChanges {
+            Label {
+                Text("Some changes on disk were missed. Rescan (⌘R) for current figures.")
+                    .font(.caption).fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(Palette.unknown)
+            }
+        } else if scan.refreshes > 0 {
+            // Honest about the one thing a refresh cannot see: removing a
+            // clone or a hardlink changes what its twins elsewhere would free.
+            Text("Kept up to date as files change (\(scan.refreshes.grouped) \(scan.refreshes == 1 ? "folder" : "folders") updated). Clone figures outside them may lag until you rescan.")
+                .font(.caption2).foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
         LabeledContent("Files", value: s.files.grouped)
         LabeledContent("Directories", value: s.dirs.grouped)
         LabeledContent("Elapsed", value: String(format: "%.2fs", s.elapsed_secs))

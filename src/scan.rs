@@ -91,6 +91,10 @@ pub struct ScanResult {
     /// summarised globally but never attributed to a subtree or a selection,
     /// which is exactly what "what would deleting this actually free" needs.
     pub clone_of: HashMap<NodeId, u64>,
+    /// For each multiply-linked inode, the node whose link carries its size.
+    /// Only `refresh` reads it: a re-listing starts with no memory of links
+    /// counted elsewhere, and without this would count a new link in full.
+    pub linked: HashMap<u128, NodeId>,
     pub policies: iopolicy::Policies,
     /// `statfs`-reported used bytes for the root volume, for reconciliation.
     pub volume_used: u64,
@@ -100,6 +104,16 @@ pub struct ScanResult {
     /// subdirectory the comparison is nonsense.
     pub root_is_volume_root: bool,
     pub cancelled: bool,
+    /// Folders re-listed in place since the walk (see `refresh`). Non-zero
+    /// means clone and hardlink figures outside those folders may be stale.
+    pub refreshes: u32,
+    /// Arena slots no longer reachable from the root, left behind by
+    /// refreshes. Reclaimed by `refresh::compact` once they dominate.
+    pub garbage: usize,
+    /// Folders a refresh learned are stale but could not re-list itself: a
+    /// hardlink there took over an inode's size from a link that is gone,
+    /// and only re-reading it gives the inode's current size.
+    pub followups: Vec<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,10 +132,15 @@ impl Dedupe {
     }
     /// True if this (volume, inode) pair had not been seen before.
     fn claim(&self, fsid: i64, fileid: u64) -> bool {
-        let key = ((fsid as u64 as u128) << 64) | fileid as u128;
+        let key = link_key(fsid, fileid);
         let s = (fileid as usize) & (DEDUPE_SHARDS - 1);
         self.shards[s].lock().unwrap().insert(key)
     }
+}
+
+/// One inode's identity across the whole machine: (volume, file id).
+pub(crate) fn link_key(fsid: i64, fileid: u64) -> u128 {
+    ((fsid as u64 as u128) << 64) | fileid as u128
 }
 
 struct Families {
@@ -184,6 +203,12 @@ struct Shared {
     /// Mount points inside the root's own volume group. Their contents are
     /// already reachable through firmlinks, so entering them double-counts.
     group_mounts: HashSet<PathBuf>,
+    /// Root entries to list but not enter, by name and `Node::ino`: a refresh
+    /// already holds their subtrees, and re-walking them is exactly the cost
+    /// it avoids. A same-named folder with another inode is a different
+    /// folder, and is walked.
+    keep: HashMap<Vec<u8>, u32>,
+    linked: Mutex<HashMap<u128, NodeId>>,
     opts: Options,
     cancel: Arc<AtomicBool>,
     p_dirs: AtomicU64,
@@ -275,6 +300,10 @@ struct Pending {
     descend: bool,
     /// `ATTR_CMNEXT_CLONEID`, or 0 when this entry is not a clone member.
     cloneid: u64,
+    /// Low 32 bits of the file id, kept on the node for `refresh`.
+    ino: u32,
+    /// `link_key` of a multiply-linked file counted here, else 0.
+    link_key: u128,
 }
 
 impl Shared {
@@ -326,10 +355,19 @@ impl Shared {
                             hardlink_alias: false,
                             descend: false,
                             cloneid: 0,
+                            ino: 0,
+                            link_key: 0,
                         });
                         continue;
                     }
-                    let p = self.classify(&e, &task.path, &mut local);
+                    let mut p = self.classify(&e, &task.path, &mut local);
+                    if task.id == ROOT
+                        && p.kind == Kind::Dir
+                        && self.keep.get(&p.name) == Some(&p.ino)
+                    {
+                        p.descend = false;
+                        p.state = State::Ok;
+                    }
                     local_bytes += p.size.physical;
                     children.push(p);
                 }
@@ -346,6 +384,7 @@ impl Shared {
         // One lock acquisition per directory; children land contiguously.
         let mut subdirs: Vec<Task> = Vec::new();
         let mut clones: Vec<(NodeId, u64)> = Vec::new();
+        let mut links: Vec<(u128, NodeId)> = Vec::new();
         {
             let mut tree = self.tree.lock().unwrap();
             let first = tree.len() as NodeId;
@@ -359,8 +398,12 @@ impl Shared {
                 n.mtime = c.mtime;
                 n.size = c.size;
                 n.hardlink_alias = c.hardlink_alias;
+                n.ino = c.ino;
                 if c.cloneid != 0 {
                     clones.push((id, c.cloneid));
+                }
+                if c.link_key != 0 {
+                    links.push((c.link_key, id));
                 }
                 if c.descend {
                     subdirs.push(Task {
@@ -377,6 +420,9 @@ impl Shared {
         // minority, so this lock is almost never contended.
         if !clones.is_empty() {
             self.clone_of.lock().unwrap().extend(clones);
+        }
+        if !links.is_empty() {
+            self.linked.lock().unwrap().extend(links);
         }
 
         self.p_dirs.fetch_add(local.dirs, Ordering::Relaxed);
@@ -428,6 +474,8 @@ impl Shared {
                 hardlink_alias: false,
                 descend,
                 cloneid: 0,
+                ino: e.fileid as u32,
+                link_key: 0,
             };
         }
 
@@ -445,6 +493,8 @@ impl Shared {
                 hardlink_alias: false,
                 descend: false,
                 cloneid: 0,
+                ino: e.fileid as u32,
+                link_key: 0,
             };
         }
 
@@ -461,6 +511,8 @@ impl Shared {
                 hardlink_alias: false,
                 descend: false,
                 cloneid: 0,
+                ino: e.fileid as u32,
+                link_key: 0,
             };
         }
 
@@ -506,6 +558,9 @@ impl Shared {
             hardlink_alias: alias,
             descend: false,
             cloneid: if is_clone { e.cloneid } else { 0 },
+            ino: e.fileid as u32,
+            // Only the counted link is recorded; aliases resolve to it.
+            link_key: if e.linkcount > 1 && !alias { link_key(e.realfsid, e.fileid) } else { 0 },
         }
     }
 
@@ -541,6 +596,20 @@ pub fn scan(
     opts: Options,
     cancel: Arc<AtomicBool>,
     progress: Option<Box<dyn Fn(Progress) + Send>>,
+) -> io::Result<ScanResult> {
+    walk(root, opts, cancel, progress, HashMap::new(), 1 << 20)
+}
+
+/// `scan`, except that root folders matching `keep` (name -> `Node::ino`)
+/// are listed but not entered. Their nodes come back as childless
+/// placeholders for the caller to fill from a tree it already has.
+pub(crate) fn walk(
+    root: &Path,
+    opts: Options,
+    cancel: Arc<AtomicBool>,
+    progress: Option<Box<dyn Fn(Progress) + Send>>,
+    keep: HashMap<Vec<u8>, u32>,
+    capacity: usize,
 ) -> io::Result<ScanResult> {
     let started = Instant::now();
 
@@ -580,7 +649,7 @@ pub fn scan(
     let (volume_used, volume_total) = mounts::volume_used(&root).unwrap_or((0, 0));
     let root_is_volume_root = table.iter().any(|m| m.on == root);
 
-    let mut tree = Tree::with_capacity(1 << 20);
+    let mut tree = Tree::with_capacity(capacity);
     tree.push(root.as_os_str().as_bytes(), NO_NODE, Kind::Dir, State::Ok);
 
     let sh = Arc::new(Shared {
@@ -600,6 +669,8 @@ pub fn scan(
         stats: Mutex::new(Stats::default()),
         allowed_devs,
         group_mounts,
+        keep,
+        linked: Mutex::new(HashMap::new()),
         opts: opts.clone(),
         cancel: cancel.clone(),
         p_dirs: AtomicU64::new(0),
@@ -660,11 +731,15 @@ pub fn scan(
         skipped,
         families: sh.families.drain(),
         clone_of: sh.clone_of.into_inner().unwrap(),
+        linked: sh.linked.into_inner().unwrap(),
         policies,
         volume_used,
         volume_total,
         root_is_volume_root,
         cancelled: cancel.load(Ordering::Relaxed),
+        refreshes: 0,
+        garbage: 0,
+        followups: Vec::new(),
     })
 }
 
@@ -699,6 +774,56 @@ fn worker(sh: Arc<Shared>) {
         // Wake everyone: either there is new work, or we just went idle and
         // the others need to observe that the scan is finished.
         sh.cv.notify_all();
+    }
+}
+
+/// Add what node `n` contributed to `Stats` when it was walked, mirroring
+/// `expand`/`classify`. `refresh` uses it to take dropped nodes back out.
+pub(crate) fn tally(n: &crate::model::Node, clone_member: bool, s: &mut Stats) {
+    use crate::sys::ffi::{EF_IS_SPARSE, SF_DATALESS, UF_COMPRESSED};
+    match n.kind() {
+        Kind::Dir if n.state() == State::Ok => s.dirs += 1,
+        Kind::Symlink => s.symlinks += 1,
+        Kind::File => {
+            s.files += 1;
+            s.dataless += (n.flags & SF_DATALESS != 0) as u64;
+            s.compressed += (n.flags & UF_COMPRESSED != 0) as u64;
+            s.sparse += (n.ext_flags as u64 & EF_IS_SPARSE != 0) as u64;
+            s.hardlink_aliases += n.hardlink_alias as u64;
+            s.clone_members += clone_member as u64;
+        }
+        _ => {}
+    }
+    match (n.kind(), n.state()) {
+        (_, State::Ok | State::Skipped) => {}
+        // An entry the listing itself reported an error for: `expand` counts
+        // every one as an error, whatever state its errno maps to.
+        (Kind::Other, _) => s.errors += 1,
+        (_, State::DeniedTcc) => s.denied_tcc += 1,
+        (_, State::DeniedPerm) => s.denied_perm += 1,
+        (_, State::Error) => s.errors += 1,
+    }
+}
+
+impl Stats {
+    pub(crate) fn add(&mut self, o: &Stats) {
+        self.merge(o, |a, b| a + b);
+    }
+    pub(crate) fn sub(&mut self, o: &Stats) {
+        self.merge(o, u64::saturating_sub);
+    }
+    fn merge(&mut self, o: &Stats, f: impl Fn(u64, u64) -> u64) {
+        self.dirs = f(self.dirs, o.dirs);
+        self.files = f(self.files, o.files);
+        self.symlinks = f(self.symlinks, o.symlinks);
+        self.hardlink_aliases = f(self.hardlink_aliases, o.hardlink_aliases);
+        self.dataless = f(self.dataless, o.dataless);
+        self.compressed = f(self.compressed, o.compressed);
+        self.sparse = f(self.sparse, o.sparse);
+        self.clone_members = f(self.clone_members, o.clone_members);
+        self.denied_tcc = f(self.denied_tcc, o.denied_tcc);
+        self.denied_perm = f(self.denied_perm, o.denied_perm);
+        self.errors = f(self.errors, o.errors);
     }
 }
 

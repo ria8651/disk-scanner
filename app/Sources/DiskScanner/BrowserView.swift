@@ -25,7 +25,7 @@ struct BrowserView: View {
         // corners, its own surface flush to its own edges.
         VStack(spacing: Metrics.gap) {
             banner
-            TreemapView(model: model, scan: scan, node: model.cursor)
+            TreemapView(model: model, scan: scan, node: model.cursor, revision: model.revision)
             footer
         }
         .padding(Metrics.inset)
@@ -92,9 +92,13 @@ struct BrowserView: View {
     @ViewBuilder
     private var ancestryMenu: some View {
         ForEach(scan.ancestry(model.cursor).reversed(), id: \.self) { id in
+            // By path, as in `nodeMenu`: a refresh may renumber while it is open.
+            let path = scan.path(id)
             Button {
-                model.cursor = id
-                model.focus = nil
+                if let n = model.node(at: path) {
+                    model.cursor = n
+                    model.focus = nil
+                }
             } label: {
                 Label(
                     scan.displayName(id),
@@ -177,14 +181,25 @@ private struct SnapshotBanner: View {
 
 private struct FooterBar: View {
     let model: ScanModel
+    /// Held here, not in `VolumeFree`: the bar outlives the selection
+    /// toggling its contents, so the figure does not blink or restart.
+    @State private var space: VolumeSpace?
 
     var body: some View {
         HStack(spacing: 12) {
             if model.selection.isEmpty {
-                LegendItems()
+                LegendItems().layoutPriority(1)
                 Spacer(minLength: 0)
-                Text("⌘-click a block to see what deleting it would really free")
-                    .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                // The hint is the first thing to go when the bar is narrow:
+                // gone whole rather than cut to "⌘-click a blo…", and before
+                // the legend or the free space start truncating.
+                ViewThatFits(in: .horizontal) {
+                    Text("⌘-click a block to see what deleting it would really free")
+                        .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                    Color.clear.frame(width: 0, height: 0)
+                }
+                Divider().frame(height: 16)
+                VolumeFree(space: space)
             } else {
                 selection
             }
@@ -193,6 +208,15 @@ private struct FooterBar: View {
         .padding(.horizontal, 16)
         .padding(.vertical, model.selection.isEmpty ? 9 : 11)
         .glassEffect(.regular, in: .rect(cornerRadius: Metrics.radius, style: .continuous))
+        .task(id: model.rootPath) {
+            // Off the main thread: the important-usage figure makes macOS
+            // total up purgeable space, which is not always quick.
+            while !Task.isCancelled {
+                let p = model.rootPath
+                space = await Task.detached(priority: .utility) { VolumeSpace(p) }.value
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
 
     }
 
@@ -251,5 +275,63 @@ private struct FooterBar: View {
             .font(.caption)
             .foregroundStyle(color)
             .lineLimit(1)
+    }
+}
+
+// MARK: - Free space
+
+/// Free space on the scanned volume, as System Settings reports it.
+///
+/// "Available" there is `volumeAvailableCapacityForImportantUsage`, which
+/// counts purgeable space (caches, iCloud copies macOS will evict on demand)
+/// as free. The stricter figure — blocks actually unallocated right now — goes
+/// in the tooltip, because the gap between them is often tens of gigabytes
+/// and either alone misleads.
+///
+/// Polled by `FooterBar` rather than derived from the scan: emptying the Trash
+/// or a snapshot expiring changes it without touching anything the scan
+/// watches.
+private struct VolumeFree: View {
+    let space: VolumeSpace?
+
+    var body: some View {
+        if let v = space {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(UInt64(v.available).formattedBytes)
+                    .font(.caption.weight(.semibold)).monospacedDigit()
+                Text("free of \(UInt64(v.total).formattedBytes)")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .lineLimit(1)
+            .fixedSize()
+            .help(
+                "\(UInt64(v.available).formattedBytes) available, as System Settings counts it, "
+                    + "including purgeable space macOS frees on demand. "
+                    + "\(UInt64(v.unallocated).formattedBytes) is unallocated right now.")
+        }
+    }
+}
+
+private struct VolumeSpace: Sendable {
+    let available: Int64
+    let unallocated: Int64
+    let total: Int64
+
+    init?(_ path: String) {
+        // A fresh URL each time: resource values are cached per instance.
+        let keys: Set<URLResourceKey> = [
+            .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey,
+            .volumeTotalCapacityKey,
+        ]
+        guard let v = try? URL(fileURLWithPath: path).resourceValues(forKeys: keys),
+            let total = v.volumeTotalCapacity
+        else { return nil }
+        let free = Int64(v.volumeAvailableCapacity ?? 0)
+        // "Important usage" includes purgeable space, so it is never really
+        // below the unallocated figure. Volumes that do not support it — a
+        // Time Machine backup disk, measured — report 0 rather than nil.
+        available = max(v.volumeAvailableCapacityForImportantUsage ?? 0, free)
+        unallocated = free
+        self.total = Int64(total)
     }
 }

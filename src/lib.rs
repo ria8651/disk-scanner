@@ -21,6 +21,7 @@
 
 pub mod ffi;
 pub mod model;
+pub mod refresh;
 pub mod report;
 pub mod scan;
 pub mod sys;

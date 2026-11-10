@@ -324,21 +324,31 @@ private struct FailurePanel: View {
 /// in its own capsule on the start screen.
 struct LegendItems: View {
     var body: some View {
-        HStack(spacing: 18) {
-            item(Palette.yours, "Yours", "freed by deleting it")
-            item(Palette.cloned, "Cloned", "needs every clone gone")
-            item(Palette.pinned, "Pinned", "held by a snapshot")
-            item(Palette.unknown, "Unreadable", "not counted")
+        // The notes go before anything truncates: four names read fine on
+        // their own, "Unre… not c…" does not.
+        ViewThatFits(in: .horizontal) {
+            items(notes: true)
+            items(notes: false)
         }
         .font(.caption2)
         .lineLimit(1)
     }
 
-    private func item(_ c: Color, _ name: String, _ note: String) -> some View {
+    private func items(notes: Bool) -> some View {
+        HStack(spacing: notes ? 18 : 14) {
+            item(Palette.yours, "Yours", notes ? "freed by deleting it" : nil)
+            item(Palette.cloned, "Cloned", notes ? "needs every clone gone" : nil)
+            item(Palette.pinned, "Pinned", notes ? "held by a snapshot" : nil)
+            item(Palette.unknown, "Unreadable", notes ? "not counted" : nil)
+        }
+        .fixedSize()
+    }
+
+    private func item(_ c: Color, _ name: String, _ note: String?) -> some View {
         HStack(spacing: 5) {
             Swatch(color: c, size: 8)
             Text(name).foregroundStyle(.primary)
-            Text(note).foregroundStyle(.tertiary)
+            if let note { Text(note).foregroundStyle(.tertiary) }
         }
     }
 }

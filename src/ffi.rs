@@ -10,11 +10,15 @@
 //!
 //! # Lifecycle
 //!
-//! A scan is mutable while it runs and immutable forever after. `ds_scan_begin`
-//! spawns a thread and returns a `DsJob *` that can only be cancelled or
-//! freed; the finished `DsScan *` arrives through the completion callback.
-//! Nothing reads the tree while it is being built, which is why no lock
-//! appears anywhere below.
+//! A scan is mutable while it runs. `ds_scan_begin` spawns a thread and
+//! returns a `DsJob *` that can only be cancelled or freed; the finished
+//! `DsScan *` arrives through the completion callback. Nothing reads the tree
+//! while it is being built, which is why no lock appears anywhere below.
+//!
+//! After that the only writer is `ds_refresh_apply`, and the caller keeps it
+//! exclusive: every reader, and `ds_refresh_prepare`, runs either on the one
+//! thread that applies or strictly before it. Node ids do not survive an
+//! apply; re-resolve held ones with `ds_lookup`.
 //!
 //! # Panics
 //!
@@ -24,6 +28,7 @@
 //! `NodeId` from the UI is an expected input, not a bug.
 
 use crate::model::{Kind, NodeId, State, ROOT};
+use crate::refresh;
 use crate::report;
 use crate::scan::{self, Options, ScanResult};
 use crate::sys::tcc;
@@ -843,7 +848,8 @@ pub unsafe extern "C" fn ds_summary(scan: *const DsScan, out: *mut DsSummary) ->
         volume_used: r.volume_used,
         volume_total: r.volume_total,
         clone_reclaimable: clone_bytes,
-        node_count: r.tree.len() as u64,
+        // Live nodes: a refresh leaves unlinked slots until compaction.
+        node_count: r.tree.len().saturating_sub(r.garbage) as u64,
         arena_bytes: r.tree.memory_bytes() as u64,
         elapsed_secs: st.elapsed.as_secs_f64(),
         root_unknown_below: root.unknown_below,
@@ -927,6 +933,93 @@ pub unsafe extern "C" fn ds_skipped(
     out_str(p.as_os_str().as_bytes(), path, path_cap);
     out_str(why.as_bytes(), reason, reason_cap);
     true
+}
+
+// ---------------------------------------------------------------------------
+// Keeping a scan current. See `refresh` for the model.
+
+/// Re-listings of changed folders, ready to graft.
+pub struct DsPatch(refresh::Patch);
+
+/// The node at `path`, or with `nearest` the deepest node on the way to it.
+/// `DS_NO_NODE` if the path is outside the scan.
+#[no_mangle]
+pub unsafe extern "C" fn ds_lookup(scan: *const DsScan, path: *const c_char, nearest: bool) -> u32 {
+    let (Some(s), false) = (scan.as_ref(), path.is_null()) else {
+        return crate::model::NO_NODE;
+    };
+    let p = std::path::Path::new(std::ffi::OsStr::from_bytes(CStr::from_ptr(path).to_bytes()));
+    refresh::lookup(&s.r, p, nearest).unwrap_or(crate::model::NO_NODE)
+}
+
+/// Re-list one folder. NULL if the scan does not hold it (or deliberately
+/// skipped it). Does the I/O; only reads the scan, so it may run on another
+/// thread while readers continue — but never alongside an apply.
+#[no_mangle]
+pub unsafe extern "C" fn ds_refresh_prepare(scan: *const DsScan, path: *const c_char) -> *mut DsPatch {
+    let (Some(s), false) = (scan.as_ref(), path.is_null()) else {
+        return std::ptr::null_mut();
+    };
+    let p = std::path::Path::new(std::ffi::OsStr::from_bytes(CStr::from_ptr(path).to_bytes()));
+    match refresh::prepare(&s.r, p) {
+        Some(patch) => Box::into_raw(Box::new(DsPatch(patch))),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Whether `ds_refresh_prepare` would re-list `path`. Cheap; for dropping
+/// folders that are already gone from a queue before preparing them.
+#[no_mangle]
+pub unsafe extern "C" fn ds_refresh_holds(scan: *const DsScan, path: *const c_char) -> bool {
+    let (Some(s), false) = (scan.as_ref(), path.is_null()) else {
+        return false;
+    };
+    let p = std::path::Path::new(std::ffi::OsStr::from_bytes(CStr::from_ptr(path).to_bytes()));
+    refresh::holds(&s.r, p)
+}
+
+/// Graft a patch into the scan and free it. False if it no longer applied
+/// (the folder is gone, or another patch was applied since it was prepared).
+/// Invalidates node ids when true.
+#[no_mangle]
+pub unsafe extern "C" fn ds_refresh_apply(scan: *mut DsScan, patch: *mut DsPatch) -> bool {
+    if patch.is_null() {
+        return false;
+    }
+    let p = Box::from_raw(patch).0;
+    let Some(s) = scan.as_mut() else { return false };
+    *s.sort_cache.lock().unwrap() = None;
+    refresh::apply(&mut s.r, p)
+}
+
+/// Pop a folder an apply found stale but could not re-list itself; feed it
+/// back to `ds_refresh_prepare`. Returns the length the path needs, 0 when
+/// none are left. Only pops when the path fits, so `len >= cap` means "call
+/// again with more".
+#[no_mangle]
+pub unsafe extern "C" fn ds_refresh_followup(scan: *mut DsScan, buf: *mut c_char, cap: usize) -> usize {
+    let Some(s) = scan.as_mut() else { return 0 };
+    let Some(p) = s.r.followups.last() else { return 0 };
+    let n = out_str(p.as_os_str().as_bytes(), buf, cap);
+    if n < cap {
+        s.r.followups.pop();
+    }
+    n
+}
+
+/// Free a patch without applying it.
+#[no_mangle]
+pub unsafe extern "C" fn ds_patch_free(patch: *mut DsPatch) {
+    if !patch.is_null() {
+        drop(Box::from_raw(patch));
+    }
+}
+
+/// Folders refreshed since the walk. Non-zero means clone and hardlink
+/// figures elsewhere may be stale until a full rescan.
+#[no_mangle]
+pub unsafe extern "C" fn ds_refresh_count(scan: *const DsScan) -> u32 {
+    scan.as_ref().map(|s| s.r.refreshes).unwrap_or(0)
 }
 
 /// Formatted byte count, matching the CLI's units.

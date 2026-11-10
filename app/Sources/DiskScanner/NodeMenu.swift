@@ -14,13 +14,16 @@ extension View {
         contextMenu {
             let picked = model.selection.contains(node)
             let row = scan.row(node)
+            // Taken when the menu opens. A refresh can land while it is open
+            // and renumber nodes, so the actions go by path, not by `node`.
+            let path = scan.path(node)
 
             Button("Reveal in Finder", systemImage: "magnifyingglass") {
-                revealInFinder(scan.path(node))
+                revealInFinder(path)
             }
             if let row, row.kind == DS_KIND_DIR, row.child_count > 0 {
                 Button("Show in Map", systemImage: "square.grid.3x3") {
-                    model.open(node)
+                    if let n = model.node(at: path) { model.open(n) }
                 }
             }
             Divider()
@@ -28,13 +31,13 @@ extension View {
                 picked ? "Remove from Selection" : "Add to Selection",
                 systemImage: picked ? "minus.circle" : "checkmark.circle"
             ) {
-                model.toggle(node)
+                if let n = model.node(at: path) { model.toggle(n) }
             }
             Divider()
             Button("Copy Path", systemImage: "document.on.document") {
                 let pb = NSPasteboard.general
                 pb.clearContents()
-                pb.setString(scan.path(node), forType: .string)
+                pb.setString(path, forType: .string)
             }
         }
     }
