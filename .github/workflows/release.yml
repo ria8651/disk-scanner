@@ -138,9 +138,6 @@ jobs:
           generate_release_notes: true
           files: ${{ runner.temp }}/DiskScanner-${{ steps.version.outputs.new }}.zip
           body: |
-            Self-signed, not notarised by Apple. macOS will refuse to open it
-            on first launch: **System Settings > Privacy & Security >
-            Open Anyway**.
+            Self-signed, not notarised by Apple. macOS will refuse to open it on first launch: **System Settings > Privacy & Security > Open Anyway**.
 
-            To skip that entirely, build from source — `git clone` and
-            `./build-app.sh` produce an identical bundle with no quarantine.
+            To skip that entirely, build from source — `git clone` and `./build-app.sh` produce an identical bundle with no quarantine.
