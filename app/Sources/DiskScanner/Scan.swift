@@ -1,3 +1,4 @@
+import AppKit
 import DiskScannerFFI
 import Foundation
 import Observation
@@ -300,8 +301,33 @@ final class ScanModel {
     /// pick was quadratic.
     @ObservationIgnored private var dirty = DirtyQueue()
     @ObservationIgnored private var refreshing = false
+    /// A refresh that finished while a menu was open, applied when it closes.
+    /// Applying under an open context menu rebuilds it against renumbered
+    /// nodes and nothing hovered, which empties or dismisses it.
+    @ObservationIgnored private var held: (patch: PatchHandle, scan: Scan, gen: Int)?
+    @ObservationIgnored private var menusOpen = 0
     /// Counted so a frozen-looking scan can be told from a silent one.
     private var progressTicks = 0
+
+    init() {
+        // Every menu, not just ours: the menu bar renumbering under itself is
+        // harmless, but telling ours apart is not worth the plumbing.
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) {
+            [weak self] _ in MainActor.assumeIsolated { self?.menusOpen += 1 }
+        }
+        nc.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) {
+            [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.menusOpen = max(0, self.menusOpen - 1)
+                if self.menusOpen == 0, let h = self.held {
+                    self.held = nil
+                    self.finishRefresh(h.patch, h.scan, h.gen)
+                }
+            }
+        }
+    }
 
     var fullDiskAccess: Int32 { ds_full_disk_access() }
     var responsibleApp: String { cString(1024) { ds_responsible_app_hint($0, $1) } }
@@ -443,6 +469,11 @@ final class ScanModel {
         watcher?.stop()
         watcher = nil
         dirty = DirtyQueue()
+        if let h = held {
+            held = nil
+            h.patch.discard()
+            refreshing = false
+        }
     }
 
     private func noteChanges(_ dirs: Set<String>, lost: Bool) {
@@ -490,16 +521,29 @@ final class ScanModel {
     }
 
     private func finishRefresh(_ patch: PatchHandle?, _ target: Scan, _ gen: Int) {
-        refreshing = false
-        defer { pumpRefresh() }
-        guard let patch else { return }
-        guard gen == generation, let s = scan, s === target else {
-            patch.discard()
+        guard let patch else {
+            refreshing = false
+            pumpRefresh()
             return
         }
+        guard gen == generation, let s = scan, s === target else {
+            refreshing = false
+            patch.discard()
+            pumpRefresh()
+            return
+        }
+        // Still `refreshing` while held, so nothing else is prepared against
+        // the tree this patch was built from.
+        if menusOpen > 0 {
+            held = (patch, target, gen)
+            return
+        }
+        refreshing = false
+        defer { pumpRefresh() }
         // Ids are about to be invalidated: remember what they pointed at.
         let cursorPath = s.path(cursor)
         let focusPath = focus.map(s.path)
+        let highlightPath = highlighted.map(s.path)
         let picked = selection.map(s.path)
 
         let t = Date()
@@ -511,7 +555,7 @@ final class ScanModel {
 
         cursor = s.lookup(cursorPath, nearest: true) ?? s.root
         focus = focusPath.flatMap { s.lookup($0) }
-        highlighted = nil
+        highlighted = highlightPath.flatMap { s.lookup($0) }
         selection = Set(picked.compactMap { s.lookup($0) })
         reclaimMemo = nil
         revision &+= 1

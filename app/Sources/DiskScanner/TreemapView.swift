@@ -16,21 +16,24 @@ import SwiftUI
 /// draw, at any size, already has the right geometry.
 final class TreemapLayout {
     private var node: UInt32 = .max
-    private var size: CGSize = .zero
+    private var laidOut: CGSize = .zero
     private var revision = -1
     private(set) var rects: [DsRect] = []
+
+    /// The size last laid out at, if any.
+    var size: CGSize? { laidOut.width > 1 ? laidOut : nil }
 
     func rects(node: UInt32, size: CGSize, revision: Int, scan: Scan) -> [DsRect] {
         guard size.width > 1, size.height > 1 else { return [] }
         if node == self.node, revision == self.revision,
-            abs(size.width - self.size.width) < 0.5,
-            abs(size.height - self.size.height) < 0.5
+            abs(size.width - laidOut.width) < 0.5,
+            abs(size.height - laidOut.height) < 0.5
         {
             return rects
         }
         let t = Date()
         self.node = node
-        self.size = size
+        laidOut = size
         self.revision = revision
         rects = scan.treemap(of: node, size: size)
         Diag.slow("treemap layout \(rects.count) rects", t)
@@ -54,6 +57,9 @@ struct TreemapView: View {
 
     @State private var layout = TreemapLayout()
     @State private var hoverIndex: Int?
+    /// Where the pointer is, so a refresh can re-hit-test rather than drop
+    /// the hover: on a busy disk refreshes land every second or so.
+    @State private var hoverPoint: CGPoint?
 
     private var hovered: DsRect? {
         guard let i = hoverIndex, layout.rects.indices.contains(i) else { return nil }
@@ -85,12 +91,24 @@ struct TreemapView: View {
         .contentShape(.rect)
         .onContinuousHover { phase in
             switch phase {
-            case .active(let p): hoverIndex = hit(p)
-            case .ended: hoverIndex = nil
+            case .active(let p):
+                hoverPoint = p
+                hoverIndex = hit(p)
+            case .ended:
+                hoverPoint = nil
+                hoverIndex = nil
             }
         }
-        // An index into the old rects means nothing in the new ones.
-        .onChange(of: revision) { hoverIndex = nil }
+        // An index into the old rects means nothing in the new ones. The
+        // Canvas has not re-laid yet, so lay out here to hit-test the new map.
+        .onChange(of: revision) {
+            guard let p = hoverPoint, let size = layout.size else {
+                hoverIndex = nil
+                return
+            }
+            _ = layout.rects(node: node, size: size, revision: revision, scan: scan)
+            hoverIndex = hit(p)
+        }
         // ONE tap gesture. Registering `count: 2` as well forces every single
         // click to wait out the system double-click interval (~0.5s) before it
         // can commit, because the recogniser has to rule out a second click
